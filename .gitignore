@@ -1,0 +1,6 @@
+.vscode/
+build/
+
+*.out
+
+data/*ITCH*
