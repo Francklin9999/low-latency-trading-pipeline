@@ -82,13 +82,7 @@ hft_pin_core(HFT_ENGINE_RESET_LANE1_CORE "CPU core for engine reset lane-1 threa
 
 # Include paths
 target_include_directories(hft_build_flags INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/client
-    ${CMAKE_CURRENT_SOURCE_DIR}/server
-    ${CMAKE_CURRENT_SOURCE_DIR}/itch
-    ${CMAKE_CURRENT_SOURCE_DIR}/ring_buffers
-    ${CMAKE_CURRENT_SOURCE_DIR}/engine
-    ${CMAKE_CURRENT_SOURCE_DIR}/engine/oms
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${LIBXDP_INCLUDE_DIR}
     ${LIBBPF_INCLUDE_DIR}
     ${LIBBPF_UAPI_INCLUDE_DIR}
@@ -142,9 +136,9 @@ target_link_libraries(hft_build_flags INTERFACE
 
 # server
 add_executable(server
-    server/server.c
-    server/feed.c
-    server/order_receiver.c
+    apps/server/server.c
+    apps/server/feed.c
+    apps/server/order_receiver.c
 )
 
 target_compile_definitions(server PRIVATE
@@ -157,7 +151,7 @@ target_link_libraries(server PRIVATE hft_build_flags)
 
 # XDP BPF filter (only redirect UDP feed, pass TCP through)
 find_program(CLANG clang)
-set(XDP_FILTER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/afxdp/xdp_filter.bpf.c")
+set(XDP_FILTER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/afxdp/xdp_filter.bpf.c")
 set(XDP_FILTER_OBJ "${CMAKE_BINARY_DIR}/xdp_filter.bpf.o")
 
 if(CLANG)
@@ -178,12 +172,12 @@ endif()
 
 # client
 add_executable(client
-    client/client.c
-    client/order_sender.c
-    client/udp_receiver.c
-    afxdp/afxdp_receiver.c
-    itch/itch_handler.c
-    parser/parser_to_engine.c
+    apps/client/client.c
+    apps/client/order_sender.c
+    apps/client/udp_receiver.c
+    src/afxdp/afxdp_receiver.c
+    src/itch/itch_handler.c
+    src/parser/parser_to_engine.c
 )
 
 target_compile_definitions(client PRIVATE
@@ -200,11 +194,11 @@ endif()
 
 # engine
 add_executable(engine
-    engine/dispatcher.cpp
-    engine/cpu/cpu_entry.cpp
-    engine/strategy/imbalance_strat.cpp
-    engine/risk/risk.cpp
-    engine/oms/oms.cpp
+    apps/engine/dispatcher.cpp
+    src/engine/cpu/cpu_entry.cpp
+    src/engine/strategy/imbalance_strat.cpp
+    src/engine/risk/risk.cpp
+    src/engine/oms/oms.cpp
 )
 
 target_compile_definitions(engine PRIVATE

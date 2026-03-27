@@ -60,16 +60,16 @@ The goal is to measure where time goes across the pipeline, not to model every e
 
 ### Core Design
 
-- `server/feed.c` replays ITCH either sequentially or according to embedded message timestamps.
-- `client/udp_receiver.c` receives raw frames through AF_XDP, extracts UDP payloads for port `5000`, and publishes `packet_ref` pointers into the parser ring.
-- `parser/parser_to_engine.c` converts ITCH messages into compact `event` records.
-- `engine/dispatcher.cpp` batches events into two compute lanes based on `order_id % NUMBER_OF_DISPATCHERS`.
-- `engine/cpu/cpu_entry.cpp` uses AVX2 to derive per-event fields such as notional, side-specific quantities, and timestamp deltas.
-- `engine/strategy/imbalance_strat.cpp` aggregates bid/ask pressure by `stock_locate` and emits buy/sell signals.
-- `engine/risk/risk.cpp` enforces order-rate, quantity, notional, and per-symbol position limits.
-- `engine/oms/oms.cpp` writes compact `order` structs into the outbound shared-memory ring.
-- `client/order_sender.c` drains the order ring and writes orders to the server over non-blocking TCP.
-- `server/order_receiver.c` timestamps received orders and writes sampled latency reports to `results/`.
+- `apps/server/feed.c` replays ITCH either sequentially or according to embedded message timestamps.
+- `apps/client/udp_receiver.c` receives raw frames through AF_XDP, extracts UDP payloads for port `5000`, and publishes `packet_ref` pointers into the parser ring.
+- `src/parser/parser_to_engine.c` converts ITCH messages into compact `event` records.
+- `apps/engine/dispatcher.cpp` batches events into two compute lanes based on `order_id % NUMBER_OF_DISPATCHERS`.
+- `src/engine/cpu/cpu_entry.cpp` uses AVX2 to derive per-event fields such as notional, side-specific quantities, and timestamp deltas.
+- `src/engine/strategy/imbalance_strat.cpp` aggregates bid/ask pressure by `stock_locate` and emits buy/sell signals.
+- `src/engine/risk/risk.cpp` enforces order-rate, quantity, notional, and per-symbol position limits.
+- `src/engine/oms/oms.cpp` writes compact `order` structs into the outbound shared-memory ring.
+- `apps/client/order_sender.c` drains the order ring and writes orders to the server over non-blocking TCP.
+- `apps/server/order_receiver.c` timestamps received orders and writes sampled latency reports to `results/`.
 
 ### Main Shared-Memory Structures
 
@@ -90,7 +90,7 @@ Current ring sizes:
 
 - `NUMBER_OF_DISPATCHERS = 2`
 - default build uses the balanced batch preset: `BATCH_MAX = 1024`
-- alternate latency and throughput presets exist in `engine/batch_sizes.hpp`
+- alternate latency and throughput presets exist in `include/hft/engine/batch_sizes.hpp`
 
 The current CMake build does not expose a toggle for those presets, so the default build stays on the balanced configuration unless you add compile definitions manually.
 
@@ -120,13 +120,13 @@ The dispatcher currently handles these ITCH-derived events:
                                       |
                                       v
                           +-----------------------+
-                          | server/feed.c         |
+                          | apps/server/feed.c    |
                           | MoldUDP64 over UDP    |
                           +----------+------------+
                                      |
                                      v
                   +-------------------------------------------+
-                  | client/udp_receiver.c                     |
+                  | apps/client/udp_receiver.c                |
                   | AF_XDP RX -> packet_ref ring -> parser    |
                   +-------------------+-----------------------+
                                       |
@@ -138,7 +138,7 @@ The dispatcher currently handles these ITCH-derived events:
                                         |
                                         v
                       +---------------------------------------+
-                      | engine/dispatcher.cpp                 |
+                      | apps/engine/dispatcher.cpp            |
                       | batch -> SIMD compute -> strategy     |
                       | -> risk -> OMS                        |
                       +------------------+--------------------+
@@ -151,13 +151,13 @@ The dispatcher currently handles these ITCH-derived events:
                                         |
                                         v
                      +----------------------------------------+
-                     | client/order_sender.c                  |
+                     | apps/client/order_sender.c             |
                      | non-blocking TCP -> server receiver    |
                      +------------------+---------------------+
                                         |
                                         v
                          +-------------------------------+
-                         | server/order_receiver.c       |
+                         | apps/server/order_receiver.c  |
                          | latency report in results/    |
                          +-------------------------------+
 ```
@@ -338,20 +338,28 @@ Notional caps are present but effectively unbounded in the current configuration
 
 - `CMakeLists.txt`
   build, flags, library detection, and CPU-core pinning config
-- `server/`
+- `apps/server/`
   UDP ITCH replay and TCP order receiver
-- `client/`
+- `apps/client/`
   AF_XDP ingress, parser thread, and TCP order sender
-- `engine/`
-  dispatcher, SIMD compute path, strategy, risk, and OMS
-- `parser/`
+- `apps/engine/`
+  engine dispatcher entry point
+- `src/engine/`
+  SIMD compute path, strategy, risk, and OMS
+- `src/parser/`
   ITCH packet-to-event conversion
-- `itch/`
+- `src/itch/`
   ITCH message structs and handler dispatch
-- `ring_buffers/`
-  parser, event, and order ring definitions
-- `afxdp/`
+- `src/afxdp/`
   AF_XDP socket setup and XDP BPF filter
+- `src/pools/`
+  event and message object pools
+- `include/hft/`
+  all project headers, namespaced under `hft/`
+- `include/hft/ring_buffers/`
+  parser, event, and order ring definitions
+- `scripts/`
+  build and run helpers
 - `data/`
   replay input
 - `results/`
