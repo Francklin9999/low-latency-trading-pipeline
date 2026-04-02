@@ -6,40 +6,28 @@ import sys
 import glob
 from collections import deque
 
-# ─── Layout constants — must match C headers ─────────────────────────────────
-
-# Both ring buffers use alignas(64) for cursors:
-#   next_write at byte 0, next_read at byte 64, data[] at byte 128
+# must match C headers - both ring buffers use alignas(64) cursors
 CURSOR_WRITE_OFF = 0
 CURSOR_READ_OFF  = 64
 DATA_OFF         = 128
 
-# event_to_engine  (event_to_engine.h)
-EVENT_RING_SIZE = 512 * 1024           # EVENT_TO_ENGINE_SIZE
+EVENT_RING_SIZE = 512 * 1024
 EVENT_RING_MASK = EVENT_RING_SIZE - 1
-EVENT_SIZE      = 32                   # sizeof(event) aligned(32)
+EVENT_SIZE      = 32
 
-# order_to_exc  (order_to_exc.h)
-ORDER_RING_SIZE = 512 * 1024           # ORDER_TO_EXC_SIZE
+ORDER_RING_SIZE = 512 * 1024
 ORDER_RING_MASK = ORDER_RING_SIZE - 1
-ORDER_SIZE      = 64                   # cache-line aligned
+ORDER_SIZE      = 64
 
-# order struct layout (little-endian):
-#   +0   uint64  order_id
-#   +8   uint64  ts          ← steady_clock::now() at OMS submit
-#   +16  uint32  price
-#   +20  uint32  qty
-#   +24  uint16  stock_locate
-#   +26  uint8   side
+# order struct: u64 order_id, u64 ts, u32 price, u32 qty, u16 locate, u8 side
 ORDER_TS_FIELD_OFF = 8
 
 SHM_EVENT = "/dev/shm/hft_event_to_strat"
 SHM_ORDER = "/dev/shm/order_to_exc"
 
 INTERVAL  = float(sys.argv[1]) if len(sys.argv) > 1 else 0.5
-HIST_SIZE = 2000   # rolling window of inter-order intervals
+HIST_SIZE = 2000
 
-# ─── ANSI ─────────────────────────────────────────────────────────────────────
 CLEAR  = '\033[2J\033[H'
 BOLD   = '\033[1m'
 DIM    = '\033[2m'
@@ -49,7 +37,6 @@ YELLOW = '\033[93m'
 RED    = '\033[91m'
 RESET  = '\033[0m'
 
-# ─── Shared memory helpers ────────────────────────────────────────────────────
 
 def open_shm(path):
     try:
@@ -70,7 +57,6 @@ def read_u64(mm, off):
 def ring_backlog(write, read):
     return (write - read) & 0xFFFFFFFF
 
-# ─── Process helpers ──────────────────────────────────────────────────────────
 
 def find_pid(name):
     try:
@@ -81,18 +67,16 @@ def find_pid(name):
         return None
 
 def proc_stat(pid):
-    """Return (utime+stime jiffies, rss_kb)."""
     try:
         with open(f'/proc/{pid}/stat') as f:
             fields = f.read().split()
         jiffies = int(fields[13]) + int(fields[14])
-        rss_kb  = int(fields[23]) * 4          # pages → KB
+        rss_kb  = int(fields[23]) * 4
         return jiffies, rss_kb
     except Exception:
         return 0, 0
 
 def proc_schedstat(pid):
-    """Return (cpu_ns, wait_ns) summed over all threads."""
     cpu_ns = wait_ns = 0
     try:
         for path in glob.glob(f'/proc/{pid}/task/*/schedstat'):
@@ -104,7 +88,6 @@ def proc_schedstat(pid):
         pass
     return cpu_ns, wait_ns
 
-# ─── Statistics helpers ───────────────────────────────────────────────────────
 
 def percentile(data, p):
     if not data:
@@ -142,7 +125,6 @@ def backlog_color(bl, ring_size):
         return YELLOW
     return GREEN
 
-# ─── Main loop ────────────────────────────────────────────────────────────────
 
 def main():
     evt_fd, evt_mm = open_shm(SHM_EVENT)
@@ -164,7 +146,7 @@ def main():
     inter_order_ns = deque(maxlen=HIST_SIZE)
     last_order_ts  = None
 
-    print(f"Watching HFT ring buffers — interval={INTERVAL}s — Ctrl-C to quit")
+    print(f"watching ring buffers  interval={INTERVAL}s  Ctrl-C to quit")
     time.sleep(INTERVAL)
 
     while True:
@@ -172,17 +154,14 @@ def main():
         dt  = now - prev_time
         prev_time = now
 
-        # Re-open shm if processes restarted
         if evt_mm is None:
             evt_fd, evt_mm = open_shm(SHM_EVENT)
         if ord_mm is None:
             ord_fd, ord_mm = open_shm(SHM_ORDER)
 
-        # Re-detect pids
         for n in proc_names:
             pids[n] = find_pid(n)
 
-        # ── Ring buffer cursors ───────────────────────────────────────────────
         if evt_mm:
             evt_w = read_u32(evt_mm, CURSOR_WRITE_OFF)
             evt_r = read_u32(evt_mm, CURSOR_READ_OFF)
@@ -203,7 +182,6 @@ def main():
         evt_bl = ring_backlog(evt_w, evt_r)
         ord_bl = ring_backlog(ord_w, ord_r)
 
-        # ── Collect order timestamps ──────────────────────────────────────────
         if ord_mm and d_ord_w > 0:
             count = min(d_ord_w, ORDER_RING_SIZE)
             for i in range(count):
@@ -215,15 +193,14 @@ def main():
                         inter_order_ns.append(ts_ns - last_order_ts)
                     last_order_ts = ts_ns
 
-        # ── CPU and schedstat ─────────────────────────────────────────────────
-        cpu_pct  = {}
-        rss_mb   = {}
-        wait_ms  = {}   # total thread scheduler wait in this interval
+        cpu_pct = {}
+        rss_mb  = {}
+        wait_ms = {}
         for n in proc_names:
             pid = pids[n]
             if pid:
                 j, rss  = proc_stat(pid)
-                dj      = (j - prev_jif.get(n, 0))
+                dj      = j - prev_jif.get(n, 0)
                 cpu_pct[n] = min((dj / hz / dt) * 100.0, 999.0)
                 rss_mb[n]  = rss / 1024
                 prev_jif[n] = j
@@ -235,7 +212,6 @@ def main():
             else:
                 cpu_pct[n] = rss_mb[n] = wait_ms[n] = 0
 
-        # ── Render ────────────────────────────────────────────────────────────
         W   = 64
         sep = f"{BOLD}{CYAN}{'─' * W}{RESET}"
         out = [CLEAR]
@@ -246,7 +222,6 @@ def main():
                    f"interval={INTERVAL}s{RESET}")
         out.append(sep)
 
-        # Event ring
         eb_col = backlog_color(evt_bl, EVENT_RING_SIZE)
         out.append(f"\n{BOLD}EVENT RING{RESET}  /dev/shm/{SHM_EVENT.split('/')[-1]}")
         if evt_mm:
@@ -260,7 +235,6 @@ def main():
         else:
             out.append(f"  {RED}not found — start client + engine first{RESET}")
 
-        # Order ring
         ob_col = backlog_color(ord_bl, ORDER_RING_SIZE)
         out.append(f"\n{BOLD}ORDER RING{RESET}  /dev/shm/{SHM_ORDER.split('/')[-1]}")
         if ord_mm:
@@ -274,10 +248,8 @@ def main():
         else:
             out.append(f"  {RED}not found — start engine first{RESET}")
 
-        # Inter-order latency
         out.append(f"\n{BOLD}INTER-ORDER LATENCY{RESET}  "
-                   f"{DIM}time between consecutive OMS submissions "
-                   f"(rolling {HIST_SIZE} samples){RESET}")
+                   f"{DIM}rolling {HIST_SIZE} samples{RESET}")
         if inter_order_ns:
             d   = list(inter_order_ns)
             avg = int(sum(d) / len(d))
@@ -291,16 +263,15 @@ def main():
         else:
             out.append(f"  {DIM}waiting for orders...{RESET}")
 
-        # Process stats
         out.append(f"\n{BOLD}PROCESSES{RESET}")
         out.append(f"  {'name':<8}  {'pid':<7}  {'cpu':>6}  {'bar':^12}  "
                    f"{'rss':>7}  {'sched-wait':>12}")
         for n in proc_names:
             pid = pids[n]
             if pid:
-                cpu   = cpu_pct[n]
-                bar   = pct_bar(cpu)
-                jc    = RED if wait_ms[n] > 100 else YELLOW if wait_ms[n] > 10 else GREEN
+                cpu = cpu_pct[n]
+                bar = pct_bar(cpu)
+                jc  = RED if wait_ms[n] > 100 else YELLOW if wait_ms[n] > 10 else GREEN
                 out.append(
                     f"  {n:<8}  {pid:<7}  "
                     f"{(RED if cpu>90 else YELLOW if cpu>60 else GREEN)}"
@@ -312,8 +283,8 @@ def main():
             else:
                 out.append(f"  {n:<8}  {DIM}not running{RESET}")
 
-        out.append(f"\n{DIM}inter-order latency ≠ pipeline latency — "
-                   f"add recv_ns to event struct for true end-to-end measurement{RESET}")
+        out.append(f"\n{DIM}note: inter-order latency != pipeline latency; "
+                   f"add recv_ns to event struct for true end-to-end{RESET}")
         out.append(sep)
 
         print('\n'.join(out), end='', flush=True)
@@ -328,4 +299,4 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{RESET}Stopped.")
+        print(f"\n{RESET}stopped.")
