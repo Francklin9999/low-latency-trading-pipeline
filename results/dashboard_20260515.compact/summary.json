@@ -1,0 +1,38 @@
+{
+  "input": "results/dashboard_logs/dashboard_20260515.txt",
+  "input_bytes": 93001831628,
+  "output_dir": "results/dashboard_20260515.compact",
+  "output_bytes_total": 1412221990,
+  "compression_ratio": 65.85,
+  "counts": {
+    "kind.service_start": 3,
+    "order_ack": 44696327,
+    "telemetry.ack": 44696442,
+    "telemetry.feed": 388997221,
+    "telemetry.health": 38543,
+    "telemetry.lat_stats": 20883,
+    "telemetry.mm_stats": 20883,
+    "telemetry.order": 44696516
+  },
+  "outputs": {
+    "feed_per_sec.csv.gz": 246858,
+    "health.csv.gz": 984730,
+    "lat_stats.csv.gz": 291416,
+    "mm_stats.csv.gz": 3867104,
+    "order_acks_19700112_13.csv.gz": 21944133,
+    "order_acks_19700113_00.csv.gz": 149799904,
+    "order_acks_19700113_01.csv.gz": 254133509,
+    "order_acks_19700113_02.csv.gz": 218929882,
+    "order_acks_19700113_03.csv.gz": 182253367,
+    "order_acks_19700113_04.csv.gz": 151326602,
+    "order_acks_19700113_05.csv.gz": 156918116,
+    "order_acks_19700113_06.csv.gz": 220784872,
+    "order_acks_19700113_07.csv.gz": 38822994,
+    "order_acks_19700113_08.csv.gz": 1333344,
+    "order_acks_19700113_09.csv.gz": 3573673,
+    "order_acks_19700113_10.csv.gz": 6497170,
+    "order_acks_19700113_11.csv.gz": 483371,
+    "order_acks_per_minute.csv.gz": 30945
+  },
+  "elapsed_s": 3487.54
+}

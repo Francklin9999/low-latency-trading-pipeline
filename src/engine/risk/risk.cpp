@@ -1,74 +1,64 @@
 #include "hft/engine/risk/risk.hpp"
-#include <atomic>
-#include <chrono>
+
+#include <cstdint>
 
 namespace risk {
 
-static std::atomic<int32_t>  positions[65536] {};
-static std::atomic<uint64_t> daily_notional{0};
+// Hot path is single-threaded; no atomics needed. Refill is inline using
+// Signal.parse_ns (the off-path refill thread starved under SCHED_FIFO).
+static int64_t  rl_tokens       = static_cast<int64_t>(RISK_ORDER_BURST);
+static uint64_t rl_last_ns      = UINT64_MAX;   // sentinel: unprimed
+static int32_t  positions[65536]{};
+static uint64_t daily_notional  = 0;
 
-static std::atomic<uint64_t> rl_tokens{RISK_ORDER_BURST};
-static std::atomic<uint64_t> rl_last_ns{0};
+// Runtime-tunable copies of the rate-limit knobs. Initialised to the
+// compile-time defaults; set_limits() updates them at startup.
+static uint32_t rl_orders_per_sec = RISK_MAX_ORDERS_PER_SEC;
+static uint32_t rl_burst          = RISK_ORDER_BURST;
 
-static inline uint64_t mono_ns() noexcept {
-    return static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+void set_limits(uint32_t orders_per_sec, uint32_t burst) noexcept
+{
+    if (orders_per_sec > 0) rl_orders_per_sec = orders_per_sec;
+    if (burst > 0)          { rl_burst = burst; rl_tokens = static_cast<int64_t>(burst); }
 }
 
-static bool rate_check() noexcept {
-    const uint64_t now  = mono_ns();
-    uint64_t last = rl_last_ns.load(std::memory_order_relaxed);
+static inline void inline_refill(uint64_t now_ns) noexcept
+{
+    if (rl_last_ns == UINT64_MAX) { rl_last_ns = now_ns; return; }
+    if (now_ns <= rl_last_ns) return;
+    const uint64_t elapsed = now_ns - rl_last_ns;
+    const int64_t  add     = static_cast<int64_t>(
+        (elapsed * rl_orders_per_sec) / 1'000'000'000ULL);
+    if (add <= 0) return;
+    rl_last_ns = now_ns;
+    const int64_t want = rl_tokens + add;
+    rl_tokens = (want > static_cast<int64_t>(rl_burst))
+              ? static_cast<int64_t>(rl_burst) : want;
+}
 
-    if (now > last) {
-        const uint64_t elapsed_ns = now - last;
-        const uint64_t add = (elapsed_ns * RISK_MAX_ORDERS_PER_SEC) / 1000000000ULL;
-        if (add > 0 && rl_last_ns.compare_exchange_weak(
-                last, now, std::memory_order_relaxed, std::memory_order_relaxed)) {
-            uint64_t cur  = rl_tokens.load(std::memory_order_relaxed);
-            uint64_t next = cur + add;
-            if (next > RISK_ORDER_BURST) next = RISK_ORDER_BURST;
-            rl_tokens.store(next, std::memory_order_relaxed);
-        }
-    }
+bool check_and_fill(const Signal& s) noexcept
+{
+    inline_refill(s.parse_ns);
 
-    uint64_t cur = rl_tokens.load(std::memory_order_relaxed);
-    do {
-        if (cur == 0) return false;
-    } while (!rl_tokens.compare_exchange_weak(
-                 cur, cur - 1, std::memory_order_relaxed, std::memory_order_relaxed));
+    const uint64_t notional = static_cast<uint64_t>(s.price) * s.qty;
+    const int32_t  delta    = (s.side == oms::Side::BUY)
+                            ?  static_cast<int32_t>(s.qty)
+                            : -static_cast<int32_t>(s.qty);
+    const int32_t  new_pos  = positions[s.stock_locate] + delta;
 
+    const bool ok =
+          (rl_tokens                    >  0)
+        & (s.qty                        <= RISK_MAX_ORDER_QTY)
+        & (notional                     <= RISK_MAX_ORDER_NOTIONAL)
+        & (daily_notional + notional    <= RISK_MAX_DAILY_NOTIONAL)
+        & (new_pos                      <=  static_cast<int32_t>(RISK_MAX_POSITION_PER_STOCK))
+        & (new_pos                      >= -static_cast<int32_t>(RISK_MAX_POSITION_PER_STOCK));
+
+    if (!ok) return false;
+    --rl_tokens;
+    positions[s.stock_locate] = new_pos;
+    daily_notional           += notional;
     return true;
 }
 
-bool check_and_fill(const Signal& signal) noexcept {
-    if (!rate_check()) return false;
-    if (signal.qty > RISK_MAX_ORDER_QTY) return false;
-
-    const uint64_t notional = static_cast<uint64_t>(signal.price) * signal.qty;
-    if (notional > RISK_MAX_ORDER_NOTIONAL) return false;
-
-    uint64_t cur_dn = daily_notional.load(std::memory_order_relaxed);
-    do {
-        if (cur_dn + notional > RISK_MAX_DAILY_NOTIONAL) return false;
-    } while (!daily_notional.compare_exchange_weak(
-                 cur_dn, cur_dn + notional, std::memory_order_relaxed));
-
-    const int32_t delta = (signal.side == Side::BUY)
-                          ? +static_cast<int32_t>(signal.qty)
-                          : -static_cast<int32_t>(signal.qty);
-
-    int32_t cur_pos = positions[signal.stock_locate].load(std::memory_order_relaxed);
-    do {
-        const int32_t new_pos = cur_pos + delta;
-        if (new_pos > static_cast<int32_t>(RISK_MAX_POSITION_PER_STOCK) ||
-            new_pos < -static_cast<int32_t>(RISK_MAX_POSITION_PER_STOCK)) {
-            daily_notional.fetch_sub(notional, std::memory_order_relaxed);
-            return false;
-        }
-    } while (!positions[signal.stock_locate].compare_exchange_weak(
-                 cur_pos, cur_pos + delta, std::memory_order_relaxed));
-
-    return true;
-}
-
-}
+}  // namespace risk

@@ -14,4 +14,6 @@ typedef struct {
     uint64_t sequence_number;
     uint16_t message_count;
 } mold_udp64_header;
+
+typedef mold_udp64_header mold_udp64_request;
 #pragma pack(pop)

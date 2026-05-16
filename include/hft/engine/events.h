@@ -1,9 +1,11 @@
 #pragma once
 #include <stdint.h>
 
-typedef __attribute__((aligned(32))) struct {
+
+typedef struct {
     uint64_t ts;
     uint64_t order_id;
+    uint64_t aux;
 
     uint32_t price;
     uint32_t qty;

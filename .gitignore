@@ -1,6 +1,25 @@
 .vscode/
 build/
+run/*
+!run/.gitkeep
+scripts/__pycache__/
+*.pyc
 
 *.out
 
 data/*ITCH*
+
+# Results: ignore raw / heavy outputs, allow small derived artifacts to be committed.
+results/*
+# Allow compact dirs to exist...
+!results/dashboard_*.compact/
+# ...but inside them only keep the small, queryable, commit-friendly artifacts.
+results/dashboard_*.compact/*
+!results/dashboard_*.compact/health.csv.gz
+!results/dashboard_*.compact/mm_stats.csv.gz
+!results/dashboard_*.compact/lat_stats.csv.gz
+!results/dashboard_*.compact/feed_per_sec.csv.gz
+!results/dashboard_*.compact/order_acks_per_minute.csv.gz
+!results/dashboard_*.compact/summary.json
+# The per-hour order_acks_*.csv.gz chunks (each up to 250 MB) stay ignored --
+# host them externally (GitHub Release / Drive / S3) if you want them online.

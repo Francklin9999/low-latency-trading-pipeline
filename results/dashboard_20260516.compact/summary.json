@@ -1,0 +1,25 @@
+{
+  "input": "results/dashboard_logs/dashboard_20260516.txt",
+  "input_bytes": 6319667575,
+  "output_dir": "results/dashboard_20260516.compact",
+  "output_bytes_total": 102023684,
+  "compression_ratio": 61.94,
+  "counts": {
+    "kind.service_start": 1,
+    "order_ack": 3175585,
+    "telemetry.ack": 3175593,
+    "telemetry.feed": 25828036,
+    "telemetry.health": 6830,
+    "telemetry.lat_stats": 6100,
+    "telemetry.mm_stats": 6100,
+    "telemetry.order": 3175595
+  },
+  "outputs": {
+    "feed_per_sec.csv.gz": 7986,
+    "health.csv.gz": 68268,
+    "lat_stats.csv.gz": 36285,
+    "mm_stats.csv.gz": 446004,
+    "order_acks.csv.gz": 101465141
+  },
+  "elapsed_s": 210.98
+}

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -21,17 +22,44 @@
 #include "hft/utils/utils.h"
 #include "hft/afxdp/afxdp_receiver.h"
 #include "hft/client/client.h"
-#include "hft/config.h"
+#include "hft/server/server.h"
 #include "hft/ring_buffers/parser/parser_to_engine.h"
-#include "hft/ring_buffers/event/event_to_engine.h"
-#include "hft/parser/parser_to_engine.h"
 
 
 #define RX_BURST_SIZE 128
 
-event_to_engine* EVENT_ENGINE = NULL;
-order_to_exc* ORDER_TO_EXC = NULL;
+// Reorder pool capacity. Each slot is ~1.5 KB; sized to absorb several ms
+// of feed at burst rate while the rewinder is filling a gap.
+#define REORDER_MAX            512
+#define RETRANSMIT_INTERVAL_NS 5000000ULL  // 5 ms between repeat asks
+// High bit of packet_ref::umem_addr distinguishes reorder-pool slots from
+// UMEM frames in the recycle path.
+#define REORDER_ADDR_FLAG      (1ULL << 63)
+#define REORDER_ADDR_IDX_MASK  (REORDER_MAX - 1)
 
+typedef struct {
+    packet_ref ref;             // what we publish to PARSER_ENGINE
+    uint64_t   start_seq;       // MoldUDP64 sequence number
+    uint16_t   msg_count;       // # of ITCH messages in this packet
+    uint16_t   payload_len;     // bytes valid in `bytes`
+    uint8_t    used;            // slot occupancy
+    uint8_t    bytes[1500];     // copy of full UDP payload
+} reorder_slot;
+
+static reorder_slot reorder_pool[REORDER_MAX];
+
+// Sequencing state for the active session. session==0xFF... means unset.
+static unsigned char gap_session[10];
+static int           gap_session_set = 0;
+static uint64_t      gap_expected_seq = 0;
+static uint64_t      gap_last_request_ns = 0;
+static int           gap_rewinder_fd = -1;
+static struct sockaddr_in gap_rewinder_addr;
+static uint64_t      gap_dropped_packets = 0;
+static uint64_t      gap_retrans_requests = 0;
+static uint64_t      gap_retrans_filled = 0;
+
+// SPSC: udp_receiver produces, dispatcher consumes.
 parser_to_engine PARSER_ENGINE = {
     .next_write = 0,
     .next_read = 0,
@@ -43,8 +71,8 @@ static inline uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* Extract MoldUDP64 payload from a raw AF_XDP frame.
- * Two-level probe: Ethernet-framed first, raw-IP fallback if no eth header. */
+// Extract MoldUDP64 payload from a raw AF_XDP frame.
+// Two-level probe: Ethernet-framed first, raw-IP fallback if no eth header.
 static int extract_feed_payload(const uint8_t *frame, uint32_t frame_len,
                                 const uint8_t **payload, uint32_t *payload_len)
 {
@@ -57,14 +85,14 @@ static int extract_feed_payload(const uint8_t *frame, uint32_t frame_len,
     *payload = NULL;
     *payload_len = 0;
 
-    /* --- Ethernet-framed path --- */
+    // Ethernet-framed path
     if (frame_len >= sizeof(struct ethhdr)) {
         uint16_t proto;
 
         offset = sizeof(struct ethhdr);
         proto = ntohs(((const struct ethhdr *)frame)->h_proto);
 
-        /* Strip 802.1Q / 802.1ad VLAN tags. */
+        // Strip 802.1Q / 802.1ad VLAN tags.
         while (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
             if (frame_len < offset + 4)
                 return -1;
@@ -118,11 +146,11 @@ static int extract_feed_payload(const uint8_t *frame, uint32_t frame_len,
             return 0;
         }
 
-        /* Unknown EtherType — don't fall through; frame[0] is a MAC byte. */
+        // Unknown EtherType -- don't fall through; frame[0] is a MAC byte.
         return -1;
     }
 
-    /* --- Raw-IP path (no Ethernet header) --- */
+    // Raw-IP path (no Ethernet header)
 
     if (frame_len >= sizeof(struct iphdr) && ((frame[0] >> 4) == 4)) {
         const struct iphdr* ip4 = (const struct iphdr*) frame;
@@ -160,6 +188,322 @@ static int extract_feed_payload(const uint8_t *frame, uint32_t frame_len,
     return -1;
 }
 
+// Slot states: used=0 free; used=1 & start_seq>=expected pending; used=1 &
+// start_seq<expected in-flight. find/find_min/count skip in-flight slots.
+static int reorder_alloc_slot(void)
+{
+    for (int i = 0; i < REORDER_MAX; i++) {
+        if (!reorder_pool[i].used) return i;
+    }
+    return -1;
+}
+
+static reorder_slot *reorder_find(uint64_t seq)
+{
+    for (int i = 0; i < REORDER_MAX; i++) {
+        if (!reorder_pool[i].used) continue;
+        if (reorder_pool[i].start_seq < gap_expected_seq) continue;  // in-flight
+        if (reorder_pool[i].start_seq == seq)
+            return &reorder_pool[i];
+    }
+    return NULL;
+}
+
+// Find the smallest-seq pending entry (excluding in-flight).
+static reorder_slot *reorder_find_min(void)
+{
+    reorder_slot *best = NULL;
+    for (int i = 0; i < REORDER_MAX; i++) {
+        if (!reorder_pool[i].used) continue;
+        if (reorder_pool[i].start_seq < gap_expected_seq) continue;
+        if (!best || reorder_pool[i].start_seq < best->start_seq)
+            best = &reorder_pool[i];
+    }
+    return best;
+}
+
+static int reorder_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < REORDER_MAX; i++) {
+        if (!reorder_pool[i].used) continue;
+        if (reorder_pool[i].start_seq < gap_expected_seq) continue;
+        n++;
+    }
+    return n;
+}
+
+static int rewinder_open(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("[udp_receiver] rewinder socket"); return -1; }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family      = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind_addr.sin_port        = 0;  // ephemeral port -- server replies to us
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        perror("[udp_receiver] rewinder bind");
+        close(fd);
+        return -1;
+    }
+
+    // Override SERVER_IP for netns testbeds where 127.0.0.1 won't cross veth.
+    const char* rewinder_ip = getenv("HFT_REWINDER_IP");
+    if (!rewinder_ip || !*rewinder_ip) rewinder_ip = SERVER_IP;
+
+    memset(&gap_rewinder_addr, 0, sizeof(gap_rewinder_addr));
+    gap_rewinder_addr.sin_family = AF_INET;
+    gap_rewinder_addr.sin_port   = htons(RETRANSMIT_PORT);
+    gap_rewinder_addr.sin_addr.s_addr = inet_addr(rewinder_ip);
+    return fd;
+}
+
+// Hold a multicast membership so the kernel programs the NIC's L2 filter (and
+// emits IGMP joins). Returns -1 when no group is configured.
+static int mcast_membership_open(void)
+{
+    const char* group = getenv("HFT_FEED_MCAST_GROUP");
+    if (!group || !*group) return -1;
+
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (sscanf(group, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 || a < 224 || a > 239) {
+        fprintf(stderr, "[udp_receiver] HFT_FEED_MCAST_GROUP='%s' not in 224/4\n", group);
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("[udp_receiver] mcast socket"); return -1; }
+
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) {
+        perror("[udp_receiver] SO_REUSEADDR");
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(FEED_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[udp_receiver] mcast bind");
+        close(fd);
+        return -1;
+    }
+
+    struct ip_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    if (inet_pton(AF_INET, group, &mreq.imr_multiaddr) != 1) {
+        fprintf(stderr, "[udp_receiver] inet_pton group '%s'\n", group);
+        close(fd);
+        return -1;
+    }
+    // Pin to a specific interface; INADDR_ANY picks the wrong NIC on
+    // multi-homed hosts.
+    const char* iface_ip = getenv("HFT_FEED_MCAST_IFACE_IP");
+    if (iface_ip && *iface_ip) {
+        if (inet_pton(AF_INET, iface_ip, &mreq.imr_interface) != 1) {
+            fprintf(stderr, "[udp_receiver] HFT_FEED_MCAST_IFACE_IP='%s' invalid\n", iface_ip);
+            close(fd);
+            return -1;
+        }
+    } else {
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    }
+    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        perror("[udp_receiver] IP_ADD_MEMBERSHIP");
+        close(fd);
+        return -1;
+    }
+
+    printf("[udp_receiver] joined multicast group %s:%d (iface_ip=%s)\n",
+           group, FEED_PORT, (iface_ip && *iface_ip) ? iface_ip : "<any>");
+    return fd;
+}
+
+static void send_retransmit_request(uint64_t start_seq, uint16_t count, uint64_t now)
+{
+    if (gap_rewinder_fd < 0 || !gap_session_set) return;
+    if (count == 0) return;
+
+    // Rate-limit retransmit asks so a long gap can't flood the rewinder.
+    if (now - gap_last_request_ns < RETRANSMIT_INTERVAL_NS) return;
+    gap_last_request_ns = now;
+
+    mold_udp64_request req;
+    memcpy(req.session, gap_session, 10);
+    req.sequence_number = htobe64(start_seq);
+    req.message_count   = htobe16(count);
+    sendto(gap_rewinder_fd, &req, sizeof(req), 0,
+           (struct sockaddr *)&gap_rewinder_addr, sizeof(gap_rewinder_addr));
+    gap_retrans_requests++;
+}
+
+// Publish a packet_ref (UMEM or reorder-backed). Returns 0 on ring-full.
+static int publish_ref(packet_ref *ref)
+{
+    uint32_t w = atomic_load_explicit((_Atomic uint32_t *)&PARSER_ENGINE.next_write, memory_order_relaxed);
+    uint32_t r = atomic_load_explicit((_Atomic uint32_t *)&PARSER_ENGINE.next_read,  memory_order_acquire);
+    if (w - r >= PARSER_TO_ENGINE_SIZE) return 0;
+
+    PARSER_ENGINE.data[w & PARSER_ENGINE_MASK] = ref;
+    atomic_store_explicit((_Atomic uint32_t *)&PARSER_ENGINE.next_write, w + 1, memory_order_release);
+    return 1;
+}
+
+// Publish every pending slot that has become in-order with the expected seq.
+static void drain_pending(void)
+{
+    for (;;) {
+        reorder_slot *p = reorder_find(gap_expected_seq);
+        if (!p) return;
+        if (!publish_ref(&p->ref)) return;  // ring full -- try next loop
+        gap_expected_seq += p->msg_count;
+        gap_retrans_filled++;
+    }
+}
+
+// Build a packet_ref inside an existing reorder slot.
+static void build_reorder_ref(reorder_slot *slot, int slot_idx, uint64_t now_ns)
+{
+    // data points at the ITCH message blocks (after the 20-byte MoldUDP hdr).
+    slot->ref.data       = slot->bytes + sizeof(mold_udp64_header);
+    slot->ref.len        = (uint32_t)slot->payload_len - (uint32_t)sizeof(mold_udp64_header);
+    slot->ref.ts         = now_ns;
+    slot->ref.umem_addr  = REORDER_ADDR_FLAG | (uint64_t)slot_idx;
+    slot->used           = 1;
+}
+
+// Handle one MoldUDP64 packet (from AF_XDP burst or rewinder reply). Returns the
+// UMEM addr to recycle, or UINT64_MAX if pinned in PARSER_ENGINE (zero-copy).
+static uint64_t handle_payload(const uint8_t *payload, uint32_t payload_len,
+                               uint64_t afxdp_addr, uint64_t now_ns,
+                               uint8_t *umem_frame_base)
+{
+    if (payload_len < sizeof(mold_udp64_header))
+        return afxdp_addr;
+
+    const mold_udp64_header *hdr = (const mold_udp64_header *)payload;
+    const uint16_t msg_count = be16toh(hdr->message_count);
+    if (msg_count == 0) return afxdp_addr;  // heartbeat or end-of-session
+
+    const uint64_t seq = be64toh(hdr->sequence_number);
+
+    if (!gap_session_set) {
+        memcpy(gap_session, hdr->session, 10);
+        gap_session_set = 1;
+        gap_expected_seq = seq;
+    }
+
+    // Late or duplicate.
+    if (seq < gap_expected_seq) return afxdp_addr;
+
+    // Fast path: in-order AF_XDP arrival, zero-copy publish via UMEM.
+    if (seq == gap_expected_seq && afxdp_addr != UINT64_MAX && umem_frame_base) {
+        packet_ref *ref = (packet_ref *)umem_frame_base;
+        ref->data       = payload + sizeof(mold_udp64_header);
+        ref->umem_addr  = afxdp_addr;
+        ref->len        = payload_len - (uint32_t)sizeof(mold_udp64_header);
+        ref->ts         = now_ns;
+        if (!publish_ref(ref)) {
+            fprintf(stderr, "[udp_receiver] PARSER ring full, dropping seq=%llu\n",
+                    (unsigned long long)seq);
+            gap_dropped_packets++;
+            return afxdp_addr;
+        }
+        gap_expected_seq += msg_count;
+        drain_pending();
+        return UINT64_MAX;  // pinned in PARSER_ENGINE; recycle later
+    }
+
+    // In-order rewinder reply (no UMEM frame). Copy + publish.
+    if (seq == gap_expected_seq) {
+        // Dedupe: retransmit can race a late live arrival of the same seq.
+        if (reorder_find(seq)) return afxdp_addr;
+        int idx = reorder_alloc_slot();
+        if (idx < 0) {
+            gap_dropped_packets++;
+            return afxdp_addr;
+        }
+        reorder_slot *slot = &reorder_pool[idx];
+        slot->start_seq    = seq;
+        slot->msg_count    = msg_count;
+        slot->payload_len  = (uint16_t)payload_len;
+        memcpy(slot->bytes, payload, payload_len);
+        build_reorder_ref(slot, idx, now_ns);
+
+        if (!publish_ref(&slot->ref)) {
+            slot->used = 0;
+            gap_dropped_packets++;
+            return afxdp_addr;
+        }
+        gap_expected_seq += msg_count;
+        drain_pending();
+        return afxdp_addr;
+    }
+
+    // Out-of-order future packet -- buffer + ask the rewinder for the gap.
+    if (reorder_find(seq)) return afxdp_addr;  // already buffered
+
+    int idx = reorder_alloc_slot();
+    if (idx < 0) {
+        // Reorder pool full. Skip ahead to the next pending slot rather than
+        // stall; the `> expected` guard prevents the backward-skip underflow.
+        reorder_slot *next = reorder_find_min();
+        if (next && next->start_seq > gap_expected_seq) {
+            const uint64_t lost = next->start_seq - gap_expected_seq;
+            fprintf(stderr,
+                    "[udp_receiver] reorder pool full; skip-ahead from %llu to %llu (lost %llu msgs)\n",
+                    (unsigned long long)gap_expected_seq,
+                    (unsigned long long)next->start_seq,
+                    (unsigned long long)lost);
+            gap_dropped_packets += lost;
+            gap_expected_seq = next->start_seq;
+            drain_pending();
+        } else {
+            // All slots in-flight: dispatcher is back-pressuring us.
+            gap_dropped_packets++;
+        }
+        return afxdp_addr;
+    }
+
+    reorder_slot *slot = &reorder_pool[idx];
+    slot->start_seq    = seq;
+    slot->msg_count    = msg_count;
+    slot->payload_len  = (uint16_t)payload_len;
+    memcpy(slot->bytes, payload, payload_len);
+    build_reorder_ref(slot, idx, now_ns);
+
+    // Ask the rewinder for [expected, seq).
+    const uint64_t missing = seq - gap_expected_seq;
+    const uint16_t cnt = (missing > 0xFFFFu) ? 0xFFFFu : (uint16_t)missing;
+    send_retransmit_request(gap_expected_seq, cnt, now_ns);
+    return afxdp_addr;
+}
+
+// Drain any pending rewinder responses from the kernel UDP socket. Called once
+// per main-loop iteration; non-blocking.
+static void poll_rewinder(uint64_t now_ns)
+{
+    if (gap_rewinder_fd < 0) return;
+    uint8_t buf[1600];
+    for (;;) {
+        ssize_t n = recvfrom(gap_rewinder_fd, buf, sizeof(buf), 0, NULL, NULL);
+        if (n <= 0) {
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                perror("[udp_receiver] rewinder recv");
+            return;
+        }
+        (void)handle_payload(buf, (uint32_t)n, UINT64_MAX, now_ns, NULL);
+    }
+}
+
 static uint32_t env_u32_or_default(const char* name, uint32_t fallback)
 {
     char *end = NULL;
@@ -176,61 +520,39 @@ static uint32_t env_u32_or_default(const char* name, uint32_t fallback)
     return (uint32_t)parsed;
 }
 
-/* Push consumed UMEM frame addresses back to the AF_XDP fill ring.
- * recycle_read tracks how far we have already recycled (separate from
- * PARSER_ENGINE.next_read so we can batch the afxdp_recycle calls). */
+// Return consumed UMEM frames to AF_XDP fill ring; free reorder slots.
 static int recycle_consumed_frames(struct afxdp_ctx* xsk, uint32_t* recycle_read)
 {
     uint64_t addrs[RX_BURST_SIZE];
-    /* Snapshot the consumer cursor once; it only moves forward. */
-    uint32_t consumed = atomic_load_explicit(&PARSER_ENGINE.next_read, memory_order_acquire);
+    uint32_t consumed = atomic_load_explicit((_Atomic uint32_t *)&PARSER_ENGINE.next_read, memory_order_acquire);
     int n = 0;
 
     while (*recycle_read != consumed) {
         packet_ref* ref = PARSER_ENGINE.data[*recycle_read & PARSER_ENGINE_MASK];
-        addrs[n++] = ref->umem_addr; /* address token returned to the fill ring */
+        const uint64_t addr = ref->umem_addr;
         (*recycle_read)++;
 
-        if (n == RX_BURST_SIZE) {   /* flush when the batch is full */
+        if (addr & REORDER_ADDR_FLAG) {
+            const int idx = (int)(addr & REORDER_ADDR_IDX_MASK);
+            reorder_pool[idx].used = 0;
+            continue;
+        }
+
+        addrs[n++] = addr;
+        if (n == RX_BURST_SIZE) {
             if (afxdp_recycle(xsk, addrs, n) != 0)
                 return -1;
             n = 0;
         }
     }
 
-    if (n > 0 && afxdp_recycle(xsk, addrs, n) != 0) /* flush remainder */
+    if (n > 0 && afxdp_recycle(xsk, addrs, n) != 0)
         return -1;
-
     return 0;
-}
-
-void *parser_to_engine_thread(void* arg) {
-    (void) arg;
-    for (;;)
-        parse_to_engine();
-    return NULL;
 }
 
 void *udp_receiver_thread(void *arg) {
     (void)arg;
-
-    int fd_event = shm_open(SHM_EVENT_TO_STRAT, O_RDWR, 0);
-    if (fd_event == -1) {
-        fprintf(stderr, "shm_open(%s) failed: %s\n",
-                SHM_EVENT_TO_STRAT, strerror(errno));
-        _exit(1);
-    }
-
-    EVENT_ENGINE = (event_to_engine*) mmap(
-        NULL, sizeof(event_to_engine), PROT_READ | PROT_WRITE,
-        MAP_SHARED, fd_event, 0);
-    if (EVENT_ENGINE == MAP_FAILED) {
-        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
-        close(fd_event);
-        _exit(1);
-    }
-
-    close(fd_event);
 
     struct afxdp_ctx* xsk = NULL;
     struct afxdp_pkt pkts[RX_BURST_SIZE];
@@ -246,8 +568,8 @@ void *udp_receiver_thread(void *arg) {
     }
     active_ifname = ifname;
 
-    atomic_store_explicit(&PARSER_ENGINE.next_write, 0, memory_order_relaxed);
-    atomic_store_explicit(&PARSER_ENGINE.next_read, 0, memory_order_relaxed);
+    atomic_store_explicit((_Atomic uint32_t *)&PARSER_ENGINE.next_write, 0, memory_order_relaxed);
+    atomic_store_explicit((_Atomic uint32_t *)&PARSER_ENGINE.next_read,  0, memory_order_relaxed);
 
     int zc = force_zerocopy;
 
@@ -293,88 +615,103 @@ void *udp_receiver_thread(void *arg) {
            queue_id,
            zc);
 
-    pthread_t event_engine;
-    pthread_create(&event_engine, NULL, parser_to_engine_thread, NULL);
+    // Rewinder request/response uses a kernel UDP socket: the XDP filter only
+    // redirects FEED_PORT into AF_XDP.
+    gap_rewinder_fd = rewinder_open();
+    if (gap_rewinder_fd < 0)
+        fprintf(stderr, "[udp_receiver] gap recovery disabled (rewinder_open failed)\n");
 
+    int mcast_fd = mcast_membership_open();
+
+    uint64_t last_stats_ns = 0;
+    const uint64_t STATS_INTERVAL_NS = 2000000000ULL;  // 2 s
+
+    // Refresh `now` only on work or every ~4k idle polls -- the tight
+    // empty-loop pays zero clock_gettime cost.
+    uint64_t now = 0;
+    uint32_t idle_iters = 0;
     while (1) {
-        /* Return UMEM frames the engine has finished reading. */
         if (recycle_consumed_frames(xsk, &recycle_read) != 0) {
             perror("[udp_receiver] recycle_consumed");
             break;
         }
 
-        /* Pull up to RX_BURST_SIZE raw frames from the NIC. */
         int n = afxdp_recv_burst(xsk, pkts, RX_BURST_SIZE);
+        if (n > 0) { now = now_ns(); idle_iters = 0; }
+        else if ((++idle_iters & 0xFFF) == 0) {
+            now = now_ns();
+        }
+
+        if (n > 0 && last_stats_ns == 0) last_stats_ns = now;
+        if (now != 0 && now - last_stats_ns >= STATS_INTERVAL_NS) {
+            last_stats_ns = now;
+            fprintf(stderr,
+                    "[udp_receiver] expected=%llu pending=%d drops=%llu retrans_req=%llu retrans_filled=%llu\n",
+                    (unsigned long long)gap_expected_seq,
+                    reorder_count(),
+                    (unsigned long long)gap_dropped_packets,
+                    (unsigned long long)gap_retrans_requests,
+                    (unsigned long long)gap_retrans_filled);
+        }
+
+        // Drain rewinder replies before live feed so an in-flight retransmit
+        // can close a gap before the next live packet pushes past it.
+        if (now != 0) poll_rewinder(now);
         if (n < 0) {
             perror("[udp_receiver] afxdp_recv_burst");
             break;
         }
 
         if (n == 0) {
+            if (reorder_count() > 0 && gap_session_set) {
+                // Still waiting on a gap -- keep nudging the rewinder.
+                reorder_slot *next = reorder_find_min();
+                if (next && next->start_seq > gap_expected_seq) {
+                    const uint64_t missing = next->start_seq - gap_expected_seq;
+                    const uint16_t cnt =
+                        (missing > 0xFFFFu) ? 0xFFFFu : (uint16_t)missing;
+                    send_retransmit_request(gap_expected_seq, cnt, now);
+                }
+            }
             cpu_relax();
             continue;
         }
 
-        /* Snapshot both cursors once for the whole burst. */
-        uint32_t w = atomic_load_explicit(&PARSER_ENGINE.next_write, memory_order_relaxed);
-        uint32_t r = atomic_load_explicit(&PARSER_ENGINE.next_read, memory_order_acquire);
         int stop = 0;
-        uint64_t drop_addrs[RX_BURST_SIZE]; /* UMEM addresses to recycle immediately */
+        uint64_t drop_addrs[RX_BURST_SIZE];
         int drop_count = 0;
 
         for (int i = 0; i < n; i++) {
             const uint8_t* payload;
             uint32_t payload_len;
 
-            /* Not a UDP datagram on FEED_PORT — queue for immediate recycle. */
             if (extract_feed_payload(pkts[i].data, pkts[i].len, &payload, &payload_len) != 0) {
                 drop_addrs[drop_count++] = pkts[i].addr;
                 continue;
             }
-            /* Too short to hold a MoldUDP64 header — malformed, recycle. */
             if ((size_t)payload_len < sizeof(mold_udp64_header)) {
                 drop_addrs[drop_count++] = pkts[i].addr;
                 continue;
             }
 
             const mold_udp64_header* hdr = (const mold_udp64_header*) payload;
-
-            /* message_count 0xFFFF is the MoldUDP64 end-of-session signal. */
             if (be16toh(hdr->message_count) == 0xFFFF) {
-                printf("[udp_receiver] end of session at seq %lu\n",
-                       (unsigned long)be64toh(hdr->sequence_number));
+                printf("[udp_receiver] end of session at seq %lu (drops=%lu retrans_req=%lu retrans_filled=%lu)\n",
+                       (unsigned long)be64toh(hdr->sequence_number),
+                       (unsigned long)gap_dropped_packets,
+                       (unsigned long)gap_retrans_requests,
+                       (unsigned long)gap_retrans_filled);
                 drop_addrs[drop_count++] = pkts[i].addr;
                 stop = 1;
                 break;
             }
 
-            /* Engine is too slow — drop; sequence gap triggers retransmit. */
-            if (w - r >= PARSER_TO_ENGINE_SIZE) {
-                fprintf(stderr, "[udp_receiver] ring buffer full, dropping packet\n");
-                drop_addrs[drop_count++] = pkts[i].addr;
-                continue;
-            }
-
-            /* Zero-copy publish: overlay packet_ref at the start of the UMEM
-             * frame (reusing header bytes already consumed by extract_feed_payload).
-             * Parser expects a sequence of length-prefixed ITCH messages, so skip
-             * the 20-byte MoldUDP64 header and publish only message block bytes.
-             * sizeof(packet_ref)==28 bytes < 42-byte minimum header overhead. */
-            uint32_t slot = w & PARSER_ENGINE_MASK;
-            packet_ref* ref = (packet_ref*)pkts[i].data;
-            ref->data = payload + sizeof(mold_udp64_header);
-            ref->umem_addr = pkts[i].addr; /* returned to fill ring after consume */
-            ref->len = payload_len - (uint32_t)sizeof(mold_udp64_header);
-            ref->ts = now_ns();
-            PARSER_ENGINE.data[slot] = ref;
-
-            w++;
+            const uint64_t recycle_addr =
+                handle_payload(payload, payload_len, pkts[i].addr, now, pkts[i].data);
+            if (recycle_addr != UINT64_MAX)
+                drop_addrs[drop_count++] = recycle_addr;
         }
 
-        /* Publish the updated write cursor to the engine. */
-        atomic_store_explicit(&PARSER_ENGINE.next_write, w, memory_order_release);
-
-        /* Recycle dropped / end-of-session frames right away. */
         if (drop_count > 0 && afxdp_recycle(xsk, drop_addrs, drop_count) != 0) {
             perror("[udp_receiver] recycle_drop");
             break;
@@ -384,7 +721,14 @@ void *udp_receiver_thread(void *arg) {
             break;
     }
 
-    /* Drain remaining consumed frames before tearing down AF_XDP. */
+    if (gap_rewinder_fd >= 0) {
+        close(gap_rewinder_fd);
+        gap_rewinder_fd = -1;
+    }
+
+    if (mcast_fd >= 0) close(mcast_fd);
+
+    // Drain remaining consumed frames before tearing down AF_XDP.
     if (recycle_consumed_frames(xsk, &recycle_read) != 0)
         perror("[udp_receiver] recycle_consumed");
 

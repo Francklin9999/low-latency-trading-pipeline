@@ -1,253 +1,329 @@
 #define _POSIX_C_SOURCE 200809L
+#include <array>
+#include <cerrno>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <thread>
+#include <unistd.h>
 
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #endif
 
-#include "hft/engine/batch_sizes.hpp"
-#include "hft/engine/batch_structs.hpp"
-#include "hft/engine/dispatcher.hpp"
-#include "hft/engine/cpu/cpu_entry.hpp"
-#include "hft/engine/strategy/imbalance_strat.hpp"
-#include "hft/engine/risk/risk.hpp"
+#include "hft/engine/itch_book_adapter.hpp"
+#include "hft/engine/sim/fill_sim.hpp"
 #include "hft/engine/oms/oms.hpp"
+#include "hft/engine/risk/risk.hpp"
+#include "hft/engine/strategy/mm_mean_reversion.hpp"
+#include "hft/engine/strategy/signal.hpp"
+#include "hft/engine/universe.hpp"
+#include "hft/telemetry/telemetry.hpp"
 
 extern "C" {
-    #include "hft/utils/utils.h"
     #include "hft/engine/events.h"
-    #include "hft/config.h"
+    #include "hft/itch/itch_handler.h"
+    #include "hft/itch/packet.h"
+    #include "hft/utils/utils.h"
 }
-// Ring buffer headers must be outside extern "C": they include <atomic> when
-// compiled as C++, and C++ standard library headers cannot appear inside an
-// extern "C" block
-#include "hft/ring_buffers/event/event_to_engine.h"
 #include "hft/ring_buffers/order/order_to_exc.h"
+#include "hft/ring_buffers/parser/parser_to_engine.h"
 
 #ifndef HFT_ENGINE_DISPATCH_CORE
 #define HFT_ENGINE_DISPATCH_CORE 6
 #endif
-#define MAX_SIGNALS_PER_BATCH 256
-#define MAX_SIGNALS_PER_LANE (MAX_SIGNALS_PER_BATCH / NUMBER_OF_DISPATCHERS)
 
-BatchBuffer g_buf[NUMBER_OF_PING_PONG_BUFFERS] {};
-int g_ping = 0;
+static constexpr std::int32_t kPoolPerBook = 1 << 18;
+static std::array<hft::ItchBookAdapter*, hft::universe::kSize> g_books{};
+static std::array<hft::sim::FillSim, hft::universe::kSize> g_sims{};
+static hft::strategy::MarketMaker g_mm{};
 
-Signal signal_buf[NUMBER_OF_DISPATCHERS][MAX_SIGNALS_PER_LANE];
+static order_to_exc g_order_to_exc;
+order_to_exc* ORDER_TO_EXC = &g_order_to_exc;
 
-event_to_engine* EVENT_ENGINE = NULL;
-order_to_exc* ORDER_TO_EXC = NULL;
+static inline oms::Side oms_side_from(Side s) noexcept
+{
+    return (s == Side::Buy) ? oms::Side::BUY : oms::Side::SELL;
+}
+
+static bool engine_submit_quote(std::uint16_t locate, Side side, PriceTicks px,
+                                Quantity qty, std::uint64_t parse_ns) noexcept
+{
+    if (qty == 0) {
+        return oms::submit(locate, oms_side_from(side),
+                           static_cast<std::uint32_t>(px), 0,
+                           parse_ns) != 0;
+    }
+    Signal sig{
+        .stock_locate = locate,
+        .price        = static_cast<std::uint32_t>(px),
+        .qty          = static_cast<std::uint32_t>(qty),
+        .side         = oms_side_from(side),
+        .parse_ns     = parse_ns,
+    };
+    if (!risk::check_and_fill(sig)) return false;
+    return oms::submit(locate, sig.side, sig.price, sig.qty, parse_ns) != 0;
+}
 
 #ifdef __linux__
-static void pin_self_to_core(int core) {
+static void pin_self_to_core(int core)
+{
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
-        fprintf(stderr, "[engine] pin to core %d failed\n", core);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        std::fprintf(stderr, "[engine] pin to core %d failed\n", core);
+    }
 }
 #endif
 
-inline void append_add(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    AddOrderBatch& batch = g_buf[g_ping].addOrder[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.price[idx] = in.price;
-    batch.qty[idx] = in.qty;
-    batch.loc[idx] = in.stock_locate;
-    batch.side[idx] = in.side;
-    batch.notional[idx] = static_cast<std::uint32_t>(
-        static_cast<std::uint64_t>(in.price) * in.qty);
-}
+static inline void apply_event(const event& e) noexcept
+{
+    const std::uint16_t shard = hft::universe::shard_for_locate(e.stock_locate);
+    if (shard == hft::universe::kNotInUniverse) return;
+    auto& adapter = *g_books[shard];
+    auto& fsim    = g_sims[shard];
 
-inline void append_add_mpid(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    AddOrderMpidBatch& batch = g_buf[g_ping].addOrderMpid[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.price[idx] = in.price;
-    batch.qty[idx] = in.qty;
-    batch.loc[idx] = in.stock_locate;
-    batch.side[idx] = in.side;
-    batch.notional[idx] = static_cast<std::uint32_t>(
-        static_cast<std::uint64_t>(in.price) * in.qty);
-}
+    hft::ItchBookAdapter::OrderInfo trade_info{};
+    const bool have_trade_info =
+        (e.type == 'E' || e.type == 'C') && adapter.peek(e.order_id, trade_info);
 
-inline void append_modify(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    OrderModifyBatch& batch = g_buf[g_ping].orderModify[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.qty[idx] = in.qty;
-    batch.price[idx] = in.price;
-    batch.loc[idx] = in.stock_locate;
-}
-
-inline void append_exec(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    OrderExecutedPriceBatch& batch = g_buf[g_ping].orderExecPrice[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.qty[idx] = in.qty;
-    batch.price[idx] = in.price;
-    batch.loc[idx] = in.stock_locate;
-}
-
-inline void append_cancel(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    OrderCancelBatch& batch = g_buf[g_ping].orderCancel[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.qty[idx] = in.qty;
-    batch.loc[idx] = in.stock_locate;
-}
-
-inline void append_delete(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    OrderDeleteBatch& batch = g_buf[g_ping].orderDelete[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.loc[idx] = in.stock_locate;
-}
-
-inline void append_replace(const event& in) {
-    const int lane = in.order_id % NUMBER_OF_DISPATCHERS;
-    OrderReplaceBatch& batch = g_buf[g_ping].orderReplace[lane];
-    const std::uint32_t idx = batch.n++;
-    batch.new_oid[idx] = in.order_id;
-    batch.ts[idx] = in.ts;
-    batch.price[idx] = in.price;
-    batch.qty[idx] = in.qty;
-    batch.loc[idx] = in.stock_locate;
-    batch.side[idx] = in.side;
-}
-
-void process_lane(BatchBuffer& batch, int lane) {
-    cpu_op::run_lane(batch, lane);
-    const int n = imbalance::evaluate(batch.addOrder[lane], batch.addOrderMpid[lane],
-                                      signal_buf[lane], MAX_SIGNALS_PER_LANE, lane);
-    for (int i = 0; i < n; ++i) {
-        const Signal& sig = signal_buf[lane][i];
-        if (!risk::check_and_fill(sig)) continue;
-        oms::submit(sig.stock_locate, sig.side, sig.price, sig.qty, sig.parse_ns);
+    switch (e.type) {
+        case 'A':
+        case 'F':
+            adapter.onAdd(e.order_id, static_cast<char>(e.side), e.qty, e.price);
+            break;
+        case 'X':
+            adapter.onCancelPartial(e.order_id, e.qty);
+            break;
+        case 'D':
+            adapter.onDelete(e.order_id);
+            break;
+        case 'E':
+            adapter.onExecute(e.order_id, e.qty);
+            break;
+        case 'C':
+            adapter.onExecuteWithPrice(e.order_id, e.qty, e.price, 'Y');
+            break;
+        case 'U':
+            adapter.onReplace(e.order_id, e.aux, e.qty, e.price);
+            break;
+        default:
+            return;
     }
+
+    if (have_trade_info) {
+        const PriceTicks tp = (e.type == 'C')
+            ? static_cast<PriceTicks>(e.price / 100u)
+            : trade_info.px;
+        if (auto fill = fsim.onTrade(trade_info.side, tp,
+                                     static_cast<Quantity>(e.qty), e.ts)) {
+            g_mm.on_fill(shard, *fill);
+        }
+    }
+
+    g_mm.on_book_event(shard, adapter, fsim, e.ts);
 }
 
-void dispatch_to_compute(BatchBuffer& batch) {
-    process_lane(batch, 0);
-    process_lane(batch, 1);
-}
+static std::atomic<std::uint64_t> g_heartbeat{0};
+static bool g_deadman_enabled = false;
 
-void reset_lane(BatchBuffer& batch, int lane) {
-    batch.addOrder[lane].n = 0;
-    batch.addOrderMpid[lane].n = 0;
-    batch.orderModify[lane].n = 0;
-    batch.orderExecPrice[lane].n = 0;
-    batch.orderCancel[lane].n = 0;
-    batch.orderDelete[lane].n = 0;
-    batch.orderReplace[lane].n = 0;
-}
-
-void reset_all_batches(BatchBuffer& batch) {
-    reset_lane(batch, 0);
-    reset_lane(batch, 1);
-}
-
-void consume() {
+static void consume()
+{
+    std::atomic_ref<std::uint32_t> nr{PARSER_ENGINE.next_read};
+    std::atomic_ref<std::uint32_t> nw{PARSER_ENGINE.next_write};
+    std::uint32_t idle_loops = 0;
     for (;;) {
-        const int cur_ping = g_ping;
-        const int cur_pong = 1 - cur_ping;
-
-        const std::uint32_t tail = EVENT_ENGINE->next_read.load(std::memory_order_relaxed);
-        const std::uint32_t head = EVENT_ENGINE->next_write.load(std::memory_order_acquire);
-
-        const std::uint32_t avail   = (std::uint32_t)(head - tail);
-        const std::uint32_t to_read = (avail > BATCH_MAX) ? BATCH_MAX : avail;
-
-        if (to_read == 0) { cpu_relax(); continue; }
-
-        for (std::uint32_t i = 0; i < to_read; ++i) {
-            const event e = EVENT_ENGINE->data[(tail + i) & EVENT_ENGINE_MASK];
-            switch (e.type) {
-                case 'A': append_add(e); break;
-                case 'F': append_add_mpid(e); break;
-                case 'E': append_modify(e); break;
-                case 'C': append_exec(e); break;
-                case 'X': append_cancel(e); break;
-                case 'D': append_delete(e); break;
-                case 'U': append_replace(e); break;
-                default: break;
+        const std::uint32_t r = nr.load(std::memory_order_relaxed);
+        const std::uint32_t w = nw.load(std::memory_order_acquire);
+        if (r == w) {
+            if (g_deadman_enabled && ((++idle_loops & 0x3FFu) == 0u)) {
+                g_heartbeat.fetch_add(1, std::memory_order_relaxed);
             }
+            cpu_relax();
+            continue;
+        }
+        idle_loops = 0;
+
+        packet_ref* ref = PARSER_ENGINE.data[r & PARSER_ENGINE_MASK];
+        std::uint32_t offset = 0;
+        while (offset + 2u <= ref->len) {
+            const std::uint16_t msg_size =
+                be16toh(*(const std::uint16_t*)(ref->data + offset));
+            const std::uint32_t next_offset = offset + 2u + (std::uint32_t)msg_size;
+            if (next_offset > ref->len) break;
+
+            const std::uint8_t msg_type = ref->data[offset + 2u];
+            itch_handler_fn fn = dispatch_table[msg_type];
+            if (fn) {
+                event ev;
+                if (fn((uint8_t*)(ref->data + offset + 2u), &ev) == 0) {
+                    ev.ts = ref->ts;
+                    apply_event(ev);
+                }
+            }
+            offset = next_offset;
         }
 
-        EVENT_ENGINE->next_read.store(tail + to_read, std::memory_order_release);
-
-        g_ping = cur_pong;
-        dispatch_to_compute(g_buf[cur_ping]);
-        reset_all_batches(g_buf[cur_pong]);
+        nr.store(r + 1, std::memory_order_release);
+        if (g_deadman_enabled) {
+            g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
-int main() {
-#ifdef __linux__
-    pin_self_to_core(HFT_ENGINE_DISPATCH_CORE);
-    printf("[engine] dispatcher/compute/reset: core %d\n", HFT_ENGINE_DISPATCH_CORE);
+static void start_deadman_if_enabled()
+{
+    const char* env = std::getenv("HFT_DEADMAN_MS");
+    if (!env || env[0] == '\0') return;
+    char* end = nullptr;
+    const unsigned long ms = std::strtoul(env, &end, 10);
+    if (*end != '\0' || ms == 0) return;
+    g_deadman_enabled = true;
+
+    std::thread([ms]{
+        using namespace std::chrono;
+        const auto period = milliseconds(ms);
+        std::uint64_t prev = g_heartbeat.load(std::memory_order_relaxed);
+        for (;;) {
+            std::this_thread::sleep_for(period);
+            const std::uint64_t cur = g_heartbeat.load(std::memory_order_relaxed);
+            if (cur == prev) {
+                std::fprintf(stderr,
+                    "[engine] DEAD-MAN: no heartbeat for %lu ms -- global kill\n",
+                    ms);
+                hft::strategy::MarketMaker::global_kill_switch().store(
+                    true, std::memory_order_release);
+                return;
+            }
+            prev = cur;
+        }
+    }).detach();
+    std::fprintf(stderr, "[engine] dead-man enabled (%lu ms)\n", ms);
+}
+
+extern "C" {
+    void *udp_receiver_thread(void *arg);
+    void *order_sender_thread(void *arg);
+}
+
+#ifndef HFT_CLIENT_UDP_RECV_CORE
+#define HFT_CLIENT_UDP_RECV_CORE 4
+#endif
+#ifndef HFT_CLIENT_ORDER_SEND_CORE
+#define HFT_CLIENT_ORDER_SEND_CORE 5
 #endif
 
-    if (shm_unlink(SHM_EVENT_TO_STRAT) == -1) {
-        if (errno != ENOENT) {
-            fprintf(stderr, "shm_unlink(%s) failed: %s\n",
-                    SHM_EVENT_TO_STRAT, strerror(errno));
-            fflush(stderr);
+#ifdef __linux__
+static int pin_attr_to_core(pthread_attr_t* attr, int core)
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(static_cast<size_t>(core), &set);
+    int rc = pthread_attr_setaffinity_np(attr, sizeof(set), &set);
+    if (rc != 0) {
+        std::fprintf(stderr, "pthread_attr_setaffinity_np(core=%d) failed\n", core);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+int main()
+{
+#ifdef __linux__
+    // Pin all pages (current + future) so no major fault hits the hot path.
+    rlimit rlim{RLIM_INFINITY, RLIM_INFINITY};
+    setrlimit(RLIMIT_MEMLOCK, &rlim);
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::fprintf(stderr, "[trading] mlockall failed (continuing): %s\n",
+                     std::strerror(errno));
+    } else {
+        std::printf("[trading] mlockall(CURRENT|FUTURE) ok -- pages pinned\n");
+    }
+#endif
+
+    std::atomic_ref<std::uint32_t>(ORDER_TO_EXC->next_write).store(0, std::memory_order_relaxed);
+    std::atomic_ref<std::uint32_t>(ORDER_TO_EXC->next_read).store(0, std::memory_order_relaxed);
+
+    for (std::size_t i = 0; i < hft::universe::kSize; ++i) {
+        g_books[i] = new hft::ItchBookAdapter(kPoolPerBook);
+    }
+
+    // Env-tunable MM knobs (HFT_MM_*); see Params defaults in mm_mean_reversion.hpp.
+    auto env_d = [](const char* k, double dflt) {
+        const char* v = std::getenv(k);
+        return (v && *v) ? std::strtod(v, nullptr) : dflt;
+    };
+    auto env_i = [](const char* k, long dflt) {
+        const char* v = std::getenv(k);
+        return (v && *v) ? std::strtol(v, nullptr, 10) : dflt;
+    };
+    hft::strategy::Params p{};
+    p.half_spread_ticks       = (PriceTicks)env_i("HFT_MM_HALF_SPREAD_TICKS", p.half_spread_ticks);
+    p.requote_threshold_ticks = (PriceTicks)env_i("HFT_MM_REQUOTE_TICKS",     p.requote_threshold_ticks);
+    p.quote_qty               = (Quantity)  env_i("HFT_MM_QUOTE_QTY",         p.quote_qty);
+    p.ema_alpha               =             env_d("HFT_MM_EMA_ALPHA",         p.ema_alpha);
+    p.per_symbol_msgs_per_sec = (int32_t)   env_i("HFT_MM_PER_SYMBOL_RPS",    p.per_symbol_msgs_per_sec);
+    p.aggregate_msgs_per_sec  = (int32_t)   env_i("HFT_MM_AGG_RPS",           p.aggregate_msgs_per_sec);
+    p.burst_msgs              = (int32_t)   env_i("HFT_MM_BURST",             p.burst_msgs);
+    p.inventory_aversion      =             env_d("HFT_MM_INV_AVERSION",      p.inventory_aversion);
+    p.max_inventory           = (int32_t)   env_i("HFT_MM_MAX_INVENTORY",     p.max_inventory);
+    g_mm.set_params(p);
+    std::printf("[mm] half_spread=%u requote_thr=%u qty=%u ema=%.3f "
+                "rps_per_sym=%d rps_agg=%d burst=%d inv_aversion=%.4f max_inv=%d\n",
+                (unsigned)p.half_spread_ticks, (unsigned)p.requote_threshold_ticks,
+                (unsigned)p.quote_qty, p.ema_alpha,
+                p.per_symbol_msgs_per_sec, p.aggregate_msgs_per_sec, p.burst_msgs,
+                p.inventory_aversion, p.max_inventory);
+
+    g_mm.set_submit(&engine_submit_quote);
+
+    // Risk rate-limit knobs (env-tunable; defaults in risk.hpp).
+    {
+        const char* rps_env   = std::getenv("HFT_RISK_RPS");
+        const char* burst_env = std::getenv("HFT_RISK_BURST");
+        const uint32_t rps   = (rps_env   && *rps_env)   ? (uint32_t)std::strtoul(rps_env,   nullptr, 10) : 0;
+        const uint32_t burst = (burst_env && *burst_env) ? (uint32_t)std::strtoul(burst_env, nullptr, 10) : 0;
+        if (rps || burst) {
+            risk::set_limits(rps, burst);
+            std::printf("[risk] rps=%u burst=%u (env override)\n", rps, burst);
         }
     }
-    int fd_event = shm_open(SHM_EVENT_TO_STRAT, O_RDWR | O_CREAT | O_EXCL, 0666);
-    if (fd_event == -1) { perror("fd event error"); _exit(1); }
-    if (ftruncate(fd_event, sizeof(event_to_engine)) == -1) {
-        perror("ftruncate fd event");
-        _exit(1);
+    hft::telemetry::start(&g_mm);
+    start_deadman_if_enabled();
+
+#ifdef __linux__
+    pthread_attr_t recv_attr, send_attr;
+    pthread_attr_init(&recv_attr);
+    pthread_attr_init(&send_attr);
+    if (pin_attr_to_core(&recv_attr, HFT_CLIENT_UDP_RECV_CORE) != 0) return 1;
+    if (pin_attr_to_core(&send_attr, HFT_CLIENT_ORDER_SEND_CORE) != 0) return 1;
+
+    pthread_t recv_tid, send_tid;
+    if (pthread_create(&recv_tid, &recv_attr, udp_receiver_thread, nullptr) != 0) {
+        std::perror("pthread_create udp_receiver"); return 1;
     }
-
-    EVENT_ENGINE = (event_to_engine*) mmap(NULL, sizeof(event_to_engine), PROT_READ | PROT_WRITE, MAP_SHARED, fd_event, 0);
-    if (EVENT_ENGINE == MAP_FAILED) { perror("map failed event"); _exit(1); }
-
-    EVENT_ENGINE->next_write.store(0, std::memory_order_relaxed);
-    EVENT_ENGINE->next_read.store(0, std::memory_order_relaxed);
-
-    close(fd_event);
-
-    if (shm_unlink(SHM_ORDER_TO_EXC) == -1) {
-        if (errno != ENOENT) {
-            fprintf(stderr, "shm_unlink(%s) failed: %s\n",
-                    SHM_ORDER_TO_EXC, strerror(errno));
-            fflush(stderr);
-        }
+    if (pthread_create(&send_tid, &send_attr, order_sender_thread, nullptr) != 0) {
+        std::perror("pthread_create order_sender"); return 1;
     }
-    int fd_order = shm_open(SHM_ORDER_TO_EXC, O_RDWR | O_CREAT | O_EXCL, 0666);
-    if (fd_order == -1) { perror("fd event error"); _exit(1); }
-    if (ftruncate(fd_order, sizeof(order_to_exc)) == -1) {
-        perror("ftruncate fd event");
-        _exit(1);
-    }
+    pthread_attr_destroy(&recv_attr);
+    pthread_attr_destroy(&send_attr);
 
-    ORDER_TO_EXC = (order_to_exc*) mmap(NULL, sizeof(order_to_exc), PROT_READ | PROT_WRITE, MAP_SHARED, fd_order, 0);
-    if (ORDER_TO_EXC == MAP_FAILED) { perror("map failed event"); _exit(1); }
+    pin_self_to_core(HFT_ENGINE_DISPATCH_CORE);
+    std::printf("[trading] dispatcher core=%d udp=%d order=%d  universe N=%zu\n",
+                HFT_ENGINE_DISPATCH_CORE,
+                HFT_CLIENT_UDP_RECV_CORE,
+                HFT_CLIENT_ORDER_SEND_CORE,
+                hft::universe::kSize);
+#endif
 
     consume();
-
     return 0;
 }

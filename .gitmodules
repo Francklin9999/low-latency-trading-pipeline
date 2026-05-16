@@ -1,0 +1,6 @@
+[submodule "third_party/orderbook"]
+	path = third_party/orderbook
+	url = https://github.com/Francklin9999/orderbook.git
+[submodule "third_party/xdp-tutorial"]
+	path = third_party/xdp-tutorial
+	url = https://github.com/xdp-project/xdp-tutorial.git

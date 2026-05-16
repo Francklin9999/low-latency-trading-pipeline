@@ -2,14 +2,13 @@
 #define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <strings.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -28,7 +27,68 @@
 
 #define MAX_MSG_PAYLOAD ((int)(PACKET_SIZE - sizeof(mold_udp64_header)))
 
-#define DELAY_BEFORE_SENDING_S 30
+#define DELAY_BEFORE_SENDING_S_DEFAULT 30
+
+// Skip the ~440 MB of pre-market admin in the bundled 2020-01-30 file so a 1.0x
+// run hits trading load immediately. Other ITCH files replay from byte 0.
+#define ITCH_BUNDLED_FILE_SIZE     12952050754ULL  // exact size of 01302020.NASDAQ_ITCH50
+#define ITCH_BUNDLED_OPEN_OFFSET   440787451ULL    // first msg ts >= 09:30:00.000 ET
+
+static size_t initial_file_offset(off_t file_size) {
+    if ((uint64_t)file_size == ITCH_BUNDLED_FILE_SIZE) {
+        printf("[feed] bundled 2020-01-30 ITCH detected -- skipping pre-market admin\n");
+        printf("[feed] starting at byte %llu (09:30:00 ET cash open)\n",
+               (unsigned long long)ITCH_BUNDLED_OPEN_OFFSET);
+        return (size_t)ITCH_BUNDLED_OPEN_OFFSET;
+    }
+    printf("[feed] non-bundled ITCH file (size %lld) -- replaying from byte 0\n",
+           (long long)file_size);
+    return 0;
+}
+
+// HFT_FEED_DELAY_S overrides the 30s start delay (e.g. for smoke tests).
+static unsigned feed_delay_s(void) {
+    const char *v = getenv("HFT_FEED_DELAY_S");
+    if (!v || !*v) return DELAY_BEFORE_SENDING_S_DEFAULT;
+    char *end = NULL;
+    unsigned long u = strtoul(v, &end, 10);
+    if (*end != '\0') return DELAY_BEFORE_SENDING_S_DEFAULT;
+    return (unsigned)u;
+}
+
+static int ipv4_is_multicast(const char* ip) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!ip) return 0;
+    if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return 0;
+    return a >= 224 && a <= 239;
+}
+
+// Configure multicast TX. iface_ip pins the source NIC; ttl=1 keeps the frame
+// on the local segment; IP_MULTICAST_LOOP is set explicitly for loopback.
+static int configure_multicast(int fd, const char* iface_ip, int ttl) {
+    int one = 1;
+    if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &one, sizeof(one)) < 0) {
+        perror("[feed] IP_MULTICAST_LOOP");
+        return -1;
+    }
+    unsigned char ttl_u = (unsigned char)ttl;
+    if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl_u, sizeof(ttl_u)) < 0) {
+        perror("[feed] IP_MULTICAST_TTL");
+        return -1;
+    }
+    if (iface_ip && iface_ip[0] != '\0') {
+        struct in_addr local;
+        if (inet_pton(AF_INET, iface_ip, &local) != 1) {
+            fprintf(stderr, "[feed] HFT_FEED_MCAST_IFACE_IP='%s' invalid\n", iface_ip);
+            return -1;
+        }
+        if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &local, sizeof(local)) < 0) {
+            perror("[feed] IP_MULTICAST_IF");
+            return -1;
+        }
+    }
+    return 0;
+}
 
 static inline uint64_t msg_timestamp(const uint8_t* msg) {
     return ((uint64_t)msg[5] << 40) |
@@ -60,6 +120,16 @@ static void bulk_feed(int fd, struct sockaddr_in* dest,
         fprintf(stderr, "[feed] cannot open ITCH file '%s': ", itch_path);
         perror("");
         return;
+    }
+
+    struct stat st_skip;
+    if (fstat(data_fd, &st_skip) == 0) {
+        const size_t skip = initial_file_offset(st_skip.st_size);
+        if (skip > 0 && lseek(data_fd, (off_t)skip, SEEK_SET) < 0) {
+            perror("[feed] lseek to market-open offset");
+            close(data_fd);
+            return;
+        }
     }
 
     char itch_buf[65536];
@@ -104,6 +174,10 @@ static void bulk_feed(int fd, struct sockaddr_in* dest,
 
             int pkt_size = sizeof(mold_udp64_header) + payload_used;
 
+            // Populate the rewinder cache for every packet we would have sent,
+            // including dropped ones, so the client can recover via retransmit.
+            rewinder_cache_packet(session, seq, msg_count, packet, pkt_size);
+
             if (drop_every == 0 || (seq % drop_every) != 0) {
                 sendto(fd, packet, pkt_size, 0,
                        (struct sockaddr*) dest, sizeof(*dest));
@@ -138,7 +212,9 @@ static void flush_packet(int fd, struct sockaddr_in* dest,
     hdr->sequence_number = htobe64(seq);
     hdr->message_count = htobe16(msg_count);
 
-    sendto(fd, packet, sizeof(mold_udp64_header) + payload_used, 0,
+    const int pkt_size = (int)sizeof(mold_udp64_header) + payload_used;
+    rewinder_cache_packet(session, seq, msg_count, packet, (uint16_t)pkt_size);
+    sendto(fd, packet, (size_t)pkt_size, 0,
            (struct sockaddr*) dest, sizeof(*dest));
 }
 
@@ -186,7 +262,7 @@ static void timestamp_feed(int fd, struct sockaddr_in* dest,
     uint64_t current_packet_ts = 0;
     int replay_started = 0;
 
-    size_t pos = 0;
+    size_t pos = initial_file_offset(st.st_size);
     size_t file_size = (size_t)st.st_size;
 
     while (pos + 2 <= file_size) {
@@ -289,7 +365,7 @@ void *feed_thread(void* arg) {
     if (fd < 0) { perror("[feed] socket"); return NULL; }
 
     struct sockaddr_in dest;
-    bzero(&dest, sizeof(dest));
+    memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
     dest.sin_port = htons(dest_port);
     if (inet_pton(AF_INET, dest_ip, &dest.sin_addr) != 1) {
@@ -298,13 +374,27 @@ void *feed_thread(void* arg) {
         return NULL;
     }
 
+    const int multicast = ipv4_is_multicast(dest_ip);
+    if (multicast) {
+        const char* iface_ip = getenv("HFT_FEED_MCAST_IFACE_IP");
+        if (configure_multicast(fd, iface_ip, 1) != 0) {
+            close(fd);
+            return NULL;
+        }
+        printf("[feed] multicast mode (group=%s, iface_ip=%s, ttl=1)\n",
+               dest_ip, (iface_ip && iface_ip[0]) ? iface_ip : "<routed>");
+    } else {
+        printf("[feed] unicast mode (dest=%s)\n", dest_ip);
+    }
+
     unsigned char session[10];
     snprintf((char*)session, sizeof(session), "%ld", time(NULL));
 
     if (mode != TIMESTAMP_MODE) {
-        printf("[feed] sending to %s:%d in %d seconds...\n",
-               dest_ip, dest_port, DELAY_BEFORE_SENDING_S);
-        sleep(DELAY_BEFORE_SENDING_S);
+        const unsigned d = feed_delay_s();
+        printf("[feed] sending to %s:%d in %u seconds...\n",
+               dest_ip, dest_port, d);
+        if (d > 0) sleep(d);
     }
     printf("[feed] ITCH source: %s\n", itch_path);
     printf("[feed] starting (mode %d).\n", mode);
@@ -315,15 +405,15 @@ void *feed_thread(void* arg) {
             bulk_feed(fd, &dest, session, 0, 0, itch_path);
             break;
         case LOSSY_MODE:
-            printf("[feed] lossy — dropping every 100th packet\n");
+            printf("[feed] lossy -- dropping every 100th packet\n");
             bulk_feed(fd, &dest, session, 100, 0, itch_path);
             break;
         case CHAOTIC_MODE:
-            printf("[feed] chaotic — duplicating every 10th packet\n");
+            printf("[feed] chaotic -- duplicating every 10th packet\n");
             bulk_feed(fd, &dest, session, 0, 10, itch_path);
             break;
         case TIMESTAMP_MODE:
-            printf("[feed] timestamp replay — %.2fx speed\n", cfg->speed);
+            printf("[feed] timestamp replay -- %.2fx speed\n", cfg->speed);
             timestamp_feed(fd, &dest, session, itch_path, cfg->speed);
             break;
         default:

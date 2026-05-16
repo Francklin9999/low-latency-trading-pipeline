@@ -157,8 +157,8 @@ static int afxdp_socket_create(struct afxdp_ctx *ctx,
     xsk_cfg.xdp_flags = xdp_flags;
     xsk_cfg.bind_flags = bind_flags;
 
-    /* If our custom filter is loaded, don't let libxdp load the default
-     * catch-all program that would steal TCP packets on loopback. */
+    // If our custom filter is loaded, don't let libxdp load the default
+    // catch-all program that would steal TCP packets on loopback.
     if (ctx->xdp_prog)
         xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 
@@ -168,7 +168,7 @@ static int afxdp_socket_create(struct afxdp_ctx *ctx,
         ctx->xsk = NULL;
     }
 
-    /* Register socket in our custom xsks_map so the BPF program can redirect. */
+    // Register socket in our custom xsks_map so the BPF program can redirect.
     if (ret == 0 && ctx->xdp_prog) {
         int sock_fd = xsk_socket__fd(ctx->xsk);
         __u32 key = queue_id;
@@ -187,6 +187,20 @@ static int afxdp_env_flag_enabled(const char *name)
 {
     const char *value = getenv(name);
     return value && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static uint32_t env_u32_or_default(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || value[0] == '\0')
+        return fallback;
+    parsed = strtoul(value, &end, 10);
+    if (*end != '\0')
+        return fallback;
+    return (uint32_t)parsed;
 }
 
 static void afxdp_log_create_error(const char *ifname,
@@ -268,9 +282,8 @@ int afxdp_init(struct afxdp_ctx **out,
 
     prefer_skb = afxdp_env_flag_enabled("HFT_AFXDP_PREFER_SKB");
 
-    /* Load custom XDP filter that only redirects UDP feed packets to AF_XDP,
-     * letting TCP (order sender) pass through the normal kernel stack.
-     * Falls back to the default catch-all if the .o file is missing. */
+    // Load custom XDP filter that only redirects UDP feed packets to AF_XDP,
+    // letting TCP pass through; falls back to catch-all if the .o is missing.
     {
         uint32_t xdp_fl = prefer_skb ? XDP_FLAGS_SKB_MODE : 0;
         if (afxdp_load_xdp_filter(ctx, ifindex, xdp_fl) != 0)
@@ -285,6 +298,22 @@ int afxdp_init(struct afxdp_ctx **out,
             goto created;
 
         afxdp_log_create_error(ifname, queue_id, "SKB mode", ret);
+
+        // Recover from stale XDP attachments left by a previous crashed run
+        // (common on `lo`); otherwise an EBUSY here needs a manual detach.
+        if (ret == -EBUSY) {
+            (void)bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
+            (void)bpf_xdp_detach(ifindex, 0, NULL);
+
+            ret = afxdp_socket_create(ctx, ifname, queue_id, XDP_FLAGS_SKB_MODE, bind_flags);
+            if (ret == 0) {
+                fprintf(stderr,
+                        "[afxdp] recovered from busy XDP state on %s queue=%u via detach+retry\n",
+                        ifname, queue_id);
+                goto created;
+            }
+            afxdp_log_create_error(ifname, queue_id, "SKB retry", ret);
+        }
     } else {
         ret = afxdp_socket_create(ctx, ifname, queue_id, 0, bind_flags);
     }
@@ -338,6 +367,46 @@ int afxdp_init(struct afxdp_ctx **out,
 created:
     if (afxdp_refill_fq(ctx) < 0)
         goto error;
+
+    // Kernel-side busy-poll on the XSK fd: NIC is polled inside recvfrom/sendto,
+    // replacing softirq wakeups. Older kernels return ENOPROTOOPT; tunable via env.
+    {
+        const int xsk_fd = xsk_socket__fd(ctx->xsk);
+        const int prefer_busy_poll =
+            (int)env_u32_or_default("HFT_AFXDP_PREFER_BUSY_POLL", 1);
+        const int busy_poll_us =
+            (int)env_u32_or_default("HFT_AFXDP_BUSY_POLL_US", 20);
+        const int busy_poll_budget =
+            (int)env_u32_or_default("HFT_AFXDP_BUSY_POLL_BUDGET", 64);
+
+#ifdef SO_PREFER_BUSY_POLL
+        if (prefer_busy_poll &&
+            setsockopt(xsk_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
+                       &prefer_busy_poll, sizeof(prefer_busy_poll)) != 0) {
+            fprintf(stderr,
+                    "[afxdp] SO_PREFER_BUSY_POLL not available (%s) -- continuing without\n",
+                    strerror(errno));
+        }
+#endif
+#ifdef SO_BUSY_POLL
+        if (busy_poll_us > 0 &&
+            setsockopt(xsk_fd, SOL_SOCKET, SO_BUSY_POLL,
+                       &busy_poll_us, sizeof(busy_poll_us)) != 0) {
+            fprintf(stderr,
+                    "[afxdp] SO_BUSY_POLL not available (%s) -- continuing without\n",
+                    strerror(errno));
+        }
+#endif
+#ifdef SO_BUSY_POLL_BUDGET
+        if (busy_poll_budget > 0 &&
+            setsockopt(xsk_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
+                       &busy_poll_budget, sizeof(busy_poll_budget)) != 0) {
+            fprintf(stderr,
+                    "[afxdp] SO_BUSY_POLL_BUDGET not available (%s) -- continuing without\n",
+                    strerror(errno));
+        }
+#endif
+    }
 
     *out = ctx;
     return 0;

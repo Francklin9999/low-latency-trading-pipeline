@@ -2,43 +2,11 @@
 #include <stdint.h>
 #include "hft/itch/structs.h"
 #include "hft/engine/events.h"
-
-#include <arpa/inet.h>
-
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    #ifndef be16toh
-        #define be16toh(x) __builtin_bswap16(x)
-    #endif
-    #ifndef be32toh
-        #define be32toh(x) __builtin_bswap32(x)
-    #endif
-    #ifndef be64toh
-        #define be64toh(x) __builtin_bswap64(x)
-    #endif
-#else
-    #ifndef be16toh
-        #define be16toh(x) (x)
-    #endif
-    #ifndef be32toh
-        #define be32toh(x) (x)
-    #endif
-    #ifndef be64toh
-        #define be64toh(x) (x)
-    #endif
-#endif
+#include "hft/utils/utils.h"
 
 typedef int (*itch_handler_fn) (uint8_t *msg, event *out);
 
 extern itch_handler_fn dispatch_table[256];
-
-inline uint64_t get_timestamp(const uint8_t* ts) {
-    return ((uint64_t)ts[0] << 40) |
-           ((uint64_t)ts[1] << 32) |
-           ((uint64_t)ts[2] << 24) |
-           ((uint64_t)ts[3] << 16) |
-           ((uint64_t)ts[4] << 8) |
-           ((uint64_t)ts[5]);
-}
 
 int handle_system_event(uint8_t* msg, event *out);
 int handle_stock_directory(uint8_t* msg, event *out);

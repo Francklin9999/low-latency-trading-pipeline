@@ -30,7 +30,7 @@ static __always_inline int is_udp_feed(struct xdp_md *ctx)
     __u16 proto = bpf_ntohs(eth->h_proto);
     void *next = (void *)(eth + 1);
 
-    /* Skip up to two stacked VLAN tags (QinQ) with a bounded loop. */
+    // Skip up to two stacked VLAN tags (QinQ) with a bounded loop.
 #pragma clang loop unroll(full)
     for (int i = 0; i < 2; i++) {
         if (proto != ETH_P_8021Q && proto != ETH_P_8021AD)
@@ -86,7 +86,7 @@ int xdp_feed_filter(struct xdp_md *ctx)
     if (is_udp_feed(ctx))
         return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
 
-    return XDP_PASS; /* TCP and everything else → normal kernel stack */
+    return XDP_PASS; // TCP and everything else -> normal kernel stack
 }
 
 char _license[] SEC("license") = "GPL";

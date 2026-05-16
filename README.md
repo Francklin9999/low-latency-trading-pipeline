@@ -1,384 +1,307 @@
-# Low-Latency ITCH-to-Order Pipeline in C/C++
+# HFT Replay Lab
 
-A replay-driven HFT signal pipeline built in C11/C++20 for low-latency experimentation.
+Low-latency trading stack built around a replayed NASDAQ ITCH day: a simulated exchange, a fused trading binary, a passive wire observer, and a browser dashboard. Single host, ~6 KLOC, end-to-end.
 
-It replays NASDAQ ITCH over MoldUDP64, ingests packets through AF_XDP, parses market data into shared-memory rings, runs SIMD batch transforms plus a simple imbalance strategy, applies inline risk checks, and sends generated orders back to a TCP receiver that logs end-to-end latency.
+It is an **engineering lab**, not a trading system. The market maker is a workload generator; the numbers worth reading are latency, throughput, and loss counters (see [Results](#results)) — not PnL.
 
-This repository is not a full exchange simulator or production trading stack. It is a focused latency lab for studying feed handling, batch dispatch, signal generation, and order-path timing under a tightly controlled local setup.
+## At a Glance
 
-## What It Supports
+![HFT Execution Desk dashboard — engine parse-to-send latency, 387 M feed messages, 44 M ACKs at 100% success, per-symbol PnL.](dashboard.png)
 
-- NASDAQ ITCH replay from `data/01302020.NASDAQ_ITCH50`
-- MoldUDP64 UDP feed generation
-- AF_XDP packet capture with loopback fallback
-- zero-copy-style parser handoff through `packet_ref` descriptors
-- shared-memory event and order rings
-- AVX2-accelerated batch transforms for hot event paths
-- imbalance-driven signal generation
-- inline risk checks for rate, size, notional, and per-stock position
-- TCP order egress back to the local server
-- latency logging split into engine, queue, wire, and total components
-- replay modes for normal, lossy, chaotic, and timestamp-driven playback
+One full-day NASDAQ ITCH 30-Jan-2020 replay (i7-12700H, kernel 6.17, AF_XDP on `lo`, governor `powersave`):
 
-## Focus Areas
+| | |
+|---|---|
+| Engine `parse → send` | p50 **5.6 µs**  ·  p90 13.3 µs  ·  p99 52.0 µs  ·  max 135.6 µs |
+| Feed observed         | 387 M ITCH msgs / 383 M packets |
+| ACKs (1:1 with orders) | 44 M ACKs · **0** drops · **0** seq gaps · **0** bad checksums |
+| Strategy diagnostics  | 17 M rate-limited requotes (RPS budget hit) |
 
-- feed-to-signal latency instead of full exchange completeness
-- CPU pinning and predictable thread placement
-- cache-friendly batch processing
-- low-allocation IPC via shared memory ring buffers
-- stage-by-stage latency attribution
-- realistic replay stress with packet loss, duplication, and timestamp pacing
+Wire-side full round-trip (order on wire → matching ACK on wire), n = 44.7 M:
+p50 **8.30 µs** · p99 30.86 µs · p99.9 70.32 µs · p99.99 133.77 µs · max 13.19 s.
 
-## Overview
-
-The system is organized as three cooperating processes:
-
-1. `server`
-   Replays an ITCH file as MoldUDP64 over UDP and accepts generated orders over TCP.
-2. `client`
-   Captures the UDP feed with AF_XDP, parses ITCH messages, pushes normalized events into a shared-memory ring, and sends generated orders to the server.
-3. `engine`
-   Consumes parsed events, batches them by lane, runs SIMD transforms, applies the imbalance strategy and risk checks, and publishes orders into a second shared-memory ring.
-
-The main loop is:
-
-`ITCH file -> MoldUDP64 UDP -> AF_XDP capture -> parser -> EVENT_ENGINE ring -> dispatcher -> SIMD compute -> imbalance strategy -> risk -> ORDER_TO_EXC ring -> TCP sender -> order receiver -> results/*.txt`
-
-## Motivation
-
-This project isolates a practical subset of an HFT stack:
-
-- market data ingress
-- message normalization
-- fast-path compute
-- order generation
-- latency measurement
-
-The goal is to measure where time goes across the pipeline, not to model every exchange rule or venue behavior.
+The 13.19 s max is observer-side scheduling; the one-way client→server leg tops out at 3.02 ms.
 
 ## Architecture
 
-### Core Design
+Three runtime processes plus an optional control stack. Hot path:
 
-- `apps/server/feed.c` replays ITCH either sequentially or according to embedded message timestamps.
-- `apps/client/udp_receiver.c` receives raw frames through AF_XDP, extracts UDP payloads for port `5000`, and publishes `packet_ref` pointers into the parser ring.
-- `src/parser/parser_to_engine.c` converts ITCH messages into compact `event` records.
-- `apps/engine/dispatcher.cpp` batches events into two compute lanes based on `order_id % NUMBER_OF_DISPATCHERS`.
-- `src/engine/cpu/cpu_entry.cpp` uses AVX2 to derive per-event fields such as notional, side-specific quantities, and timestamp deltas.
-- `src/engine/strategy/imbalance_strat.cpp` aggregates bid/ask pressure by `stock_locate` and emits buy/sell signals.
-- `src/engine/risk/risk.cpp` enforces order-rate, quantity, notional, and per-symbol position limits.
-- `src/engine/oms/oms.cpp` writes compact `order` structs into the outbound shared-memory ring.
-- `apps/client/order_sender.c` drains the order ring and writes orders to the server over non-blocking TCP.
-- `apps/server/order_receiver.c` timestamps received orders and writes sampled latency reports to `results/`.
-
-### Main Shared-Memory Structures
-
-- `PARSER_ENGINE`
-  `packet_ref*` ring inside the client process
-- `EVENT_ENGINE`
-  shared-memory ring of normalized `event` objects
-- `ORDER_TO_EXC`
-  shared-memory ring of 64-byte `order` objects
-
-Current ring sizes:
-
-- `EVENT_TO_ENGINE_SIZE = 512k`
-- `ORDER_TO_EXC_SIZE = 512k`
-- `PARSER_TO_ENGINE_SIZE = 512k`
-
-### Batch and Lane Model
-
-- `NUMBER_OF_DISPATCHERS = 2`
-- default build uses the balanced batch preset: `BATCH_MAX = 1024`
-- alternate latency and throughput presets exist in `include/hft/engine/batch_sizes.hpp`
-
-The current CMake build does not expose a toggle for those presets, so the default build stays on the balanced configuration unless you add compile definitions manually.
-
-### Event Types on the Hot Path
-
-The dispatcher currently handles these ITCH-derived events:
-
-- `A` add order
-- `F` add order with MPID
-- `E` executed / modify-like quantity update
-- `C` executed at price
-- `X` cancel
-- `D` delete
-- `U` replace
-
-### One-Line Data Flow
-
-`AF_XDP frame -> packet_ref -> ITCH handler -> event -> batch lane -> Signal -> risk gate -> order -> TCP log`
-
-## Process Layout
-
-```text
-                           +----------------------+
-                           |  ITCH replay file    |
-                           | data/01302020...     |
-                           +----------+-----------+
-                                      |
-                                      v
-                          +-----------------------+
-                          | apps/server/feed.c    |
-                          | MoldUDP64 over UDP    |
-                          +----------+------------+
-                                     |
-                                     v
-                  +-------------------------------------------+
-                  | apps/client/udp_receiver.c                |
-                  | AF_XDP RX -> packet_ref ring -> parser    |
-                  +-------------------+-----------------------+
-                                      |
-                                      v
-                        +-------------------------------+
-                        | EVENT_ENGINE shared memory    |
-                        | normalized event records      |
-                        +---------------+---------------+
-                                        |
-                                        v
-                      +---------------------------------------+
-                      | apps/engine/dispatcher.cpp            |
-                      | batch -> SIMD compute -> strategy     |
-                      | -> risk -> OMS                        |
-                      +------------------+--------------------+
-                                         |
-                                         v
-                        +-------------------------------+
-                        | ORDER_TO_EXC shared memory    |
-                        | compact outbound orders       |
-                        +---------------+---------------+
-                                        |
-                                        v
-                     +----------------------------------------+
-                     | apps/client/order_sender.c             |
-                     | non-blocking TCP -> server receiver    |
-                     +------------------+---------------------+
-                                        |
-                                        v
-                         +-------------------------------+
-                         | apps/server/order_receiver.c  |
-                         | latency report in results/    |
-                         +-------------------------------+
+```
+ITCH file → server (feed) ──UDP/MoldUDP64──▶ AF_XDP RX ──▶ parse ──▶ book ──▶ strategy ──▶ risk ──▶ OMS ──▶ TX
+                  ▲                                                                                    │
+                  └──────────────────── TCP/AF_XDP order + ACK ◀────────────────────────────────────────┘
 ```
 
-## Latency Accounting
+```mermaid
+flowchart LR
+    ITCH[(ITCH file)] --> SRV
+    subgraph SERVER["server (process)"]
+        SRV[feed thread<br/>MoldUDP64] --> MCAST{{UDP / multicast}}
+        REW[rewinder thread<br/>retransmit cache]
+        ORX[order_receiver<br/>TCP listen]
+    end
 
-The server logs every 100th received order to limit measurement overhead.
+    subgraph TRADING["trading (process)"]
+        direction LR
+        URX[udp_receiver<br/>AF_XDP RX<br/>gap recovery] --> DSP
+        DSP[dispatcher<br/>ITCH parse<br/>book update] --> MM
+        MM[mean-reversion<br/>market maker] --> RISK
+        RISK[risk gate<br/>limits + rate] --> OMS
+        OMS[OMS] --> TX[order_sender<br/>TCP or AF_XDP TX]
+    end
 
-Example output lives in:
+    MCAST -- feed --> URX
+    URX -. retransmit req .-> REW
+    REW -. cached packets .-> URX
+    TX -- orders --> ORX
+    ORX -- ACKs --> TX
 
-- `results/orders_127.0.0.1_44968_20260306_140247.txt`
-- `results/orders_127.0.0.1_37964_20260306_135940.txt`
+    subgraph OBSERVE["control plane"]
+        WOB[wire_observer<br/>AF_PACKET capture]
+        CTL[control service<br/>HTTP + SSE + AMQP]
+        DSH[browser dashboard]
+        PG[(Postgres)]
+        MQ[(RabbitMQ)]
+    end
 
-From the `2026-03-06 14:02:47` run, steady-state sampled orders were commonly in these ranges:
+    SERVER -. PACKET_OUTGOING .-> WOB
+    TRADING -. telemetry UNIX socket .-> CTL
+    WOB -. telemetry UNIX socket .-> CTL
+    CTL -- SSE --> DSH
+    CTL --> PG
+    CTL --> MQ
+    DSH -. kill / arm cmd .-> CTL
+    CTL -. control UNIX socket .-> TRADING
+```
 
-| Stage | Measures | Typical sampled range |
-| --- | --- | --- |
-| `engine` | ITCH parse timestamp -> OMS enqueue | `0.9 us` to `6.7 us` |
-| `queue` | OMS enqueue -> client TCP send | `0.24 us` to `0.8 us` |
-| `wire` | client send -> server receive | `40 us` to `58 us` |
-| `total` | parse -> final receive | `43 us` to `58 us` |
+Process responsibilities:
 
-The same run also shows occasional multi-millisecond engine spikes, which is consistent with scheduler noise, replay burstiness, or transient backpressure.
+- **`server`** — replays ITCH as MoldUDP64 over UDP, serves retransmits from a ring cache, accepts orders over TCP and emits ACKs.
+- **`trading`** — AF_XDP receive with MoldUDP64 gap detection, in-place ITCH parse with SIMD shuffles, per-symbol order book, mean-reversion market maker, inline risk gate, OMS, and order egress (TCP or AF_XDP TX).
+- **`wire_observer`** — passive `AF_PACKET` capture of `PACKET_OUTGOING`; reconstructs feed/order/ACK/health events and forwards them to the control service over a UNIX socket.
+- **`control`** (Docker Compose) — Node.js HTTP API + SSE stream, RabbitMQ fanout, Postgres for low-rate persistence, daily append-only audit log.
+
+Design choices that matter:
+
+- XDP filter (`src/afxdp/xdp_filter.bpf.c`) redirects only the feed UDP port into AF_XDP — TCP order/ACK traffic goes through the normal kernel stack on the same interface.
+- ITCH decode uses `PSHUFB` for A/F/E/X/C/D/U; one 16-byte shuffle replaces 3–5 scalar byte-swaps per message.
+- MoldUDP64 gaps are detected in the trading path and recovered from the server rewinder.
+- Allocations, logging, and command handling are pushed off the dispatcher core.
+
+## Results
+
+### Setup
+
+- Date: 2026-05-15  ·  commit `36faf0a` (+ in-tree script/socket/path reorg)
+- Dataset: `data/01302020.NASDAQ_ITCH50` (one full TotalView-ITCH 5.0 day)
+- Replay: `HFT_SERVER_MODE=4` (timestamp-paced MoldUDP64), speed `1.0`
+- RX: AF_XDP on `lo`, custom XDP filter on FEED_PORT
+- TX: TCP (AF_XDP TX disabled on `lo`; code path is present for a real NIC)
+- CPU: i7-12700H, cores pinned (server 2–3, trading 4–6, observer 7)
+- Kernel: 6.17.10-100.fc41.x86_64  ·  GCC `-O3 -march=native -flto -mavx2 -mfma -mbmi2`
+- Governor `powersave` (deliberately untuned)
+
+### Latency
+
+Wire-side (observer-measured), n = 44,696,327 acked orders over a 23 h window covering one full session plus warm-up / cool-down:
+
+| Metric | Value |
+| --- | --- |
+| p50    | 8.30 µs |
+| p90    | 13.30 µs |
+| p99    | 30.86 µs |
+| p99.9  | 70.32 µs |
+| p99.99 | 133.77 µs |
+| mean   | 11.35 µs |
+| max    | 13.19 s (observer-side, see Notes) |
+
+![Latency CCDF — one-way client→server (blue) and observer round-trip (green) fall off by ~150 µs; full-RTT (red) carries an observer-ring tail to multi-second.](docs/charts/latency_ccdf.png)
+
+Per-leg breakdown:
+
+| Leg | p50 | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- |
+| in-binary `parse_to_send` (20 K snapshots) | 5.56 µs | 51.98 µs | 135.6 µs | 51.06 ms (worst 2 s window) |
+| client send → server recv (one-way)         | 7.94 µs | 30.79 µs | 70.40 µs | 3.02 ms |
+| full path order → ACK on wire               | 8.30 µs | 30.86 µs | 70.32 µs | 13.19 s |
+
+### Throughput
+
+| Metric | Value |
+| --- | --- |
+| feed packets       | 383,295,651 |
+| ITCH messages      | 387,391,223 |
+| orders sent        | 44,008,012  |
+| ACKs received      | 44,007,932 (80 unacked at window end) |
+| sustained ITCH/s during active trading | ~25–30 K |
+| sustained orders/s during active trading | ~3 K |
+
+![Throughput over the trading session (~30 s rolling mean) — ITCH messages in the ~10–30 K/s band with bursts to ~60 K; orders and ACKs track 1:1 near ~3 K/s, then taper through cool-down.](docs/charts/throughput.png)
+
+### Loss & Strategy Health
+
+| Metric | Value |
+| --- | --- |
+| dropped feed packets / ACK seq gaps / bad checksums | 0 / 0 / 0 |
+| observer transport drops | 0 |
+| retransmit requests issued | 0 (no gaps to recover; path verified, not load-tested) |
+| quotes issued / fills | 46,998,514 / 65,027 |
+| both-sided quote ratio | 67.18 % |
+| rate-limited requotes (per-symbol RPS exhausted) | 16,998,126 |
+| price-band / top-of-book / panic skips | 347,982 / 106 / 0 |
+| realized PnL (ticks) | -44,950,321 (concentrated in TSLA at default knobs; see Notes) |
+| max single-symbol \|inventory\| | 569 (over the 500 soft cap) |
+
+![Per-symbol realized PnL — TSLA dominates the loss; the rest cluster near zero.](docs/charts/pnl_curves.png)
+
+### Methodology
+
+- Sample window: full 23 h dashboard log (idle minutes contribute no records).
+- Percentile: numpy `nearest`-rank on the 44.7 M-row population per leg. No sampling, no interpolation.
+- Clock: `CLOCK_MONOTONIC` in the engine; `AF_PACKET` SO_TIMESTAMPNS in the observer; control service converts to ns since UNIX epoch on persist.
+- Reproducibility: per-order data is published as 13 hourly `order_acks_*.csv.gz` chunks (~1.4 GB) on a GitHub Release; derived artifacts (`health`, `mm_stats`, `lat_stats`, `feed_per_sec`, `order_acks_per_minute`) live under `results/dashboard_20260515.compact/`.
+
+### Notes
+
+- **13 s max:** the engine one-way `client→server` leg tops out at 3.02 ms. The seconds-scale outlier comes from `clientSendTs → ackObserveTs`, where the observer's `AF_PACKET` thread is occasionally scheduled off-core — not from the trading process.
+- **Strategy loss:** with `HFT_MM_HALF_SPREAD_TICKS=1` and `HFT_MM_INV_AVERSION=0.01`, the MM chases TSLA tick movement and bleeds spread. The chart exists as strategy diagnostics, not a P&L claim.
+- **Headroom:** at ~27 K msgs/s ingest and ~3 K orders/s egress, the trading process is far from saturated. Tighter percentiles need host tuning (governor, `isolcpus`, hugepages, observer on an isolated core) — not code.
+- **Next steps:** governor → `performance`; add `isolcpus=4-7 nohz_full=4-7 rcu_nocbs=4-7`; per-stage rdtsc inside the dispatcher; AF_XDP TX on a real NIC; sweep `HFT_MM_*` for the strategy.
+
+## Technology Stack
+
+- **Networking:** AF_XDP RX and (optional) TX; custom XDP/eBPF feed filter; `libxdp` + `libbpf`; MoldUDP64 replay + retransmit.
+- **Hot path:** C11 + C++20; SSE4.1 `PSHUFB` ITCH decode; AVX2 IP/UDP checksum; vendored `third_party/orderbook` limit order book.
+- **Discipline:** `pthread_setaffinity_np` core pinning; `mlockall(MCL_CURRENT | MCL_FUTURE)`; AF_XDP busy-poll where supported; hugepage-aware UMEM for TX.
+- **Observability:** passive `AF_PACKET` capture; UNIX-socket telemetry + control; Node.js + SSE dashboard; RabbitMQ fanout; Postgres persistence.
+- **Build:** CMake; Docker Compose for the control stack.
+
+## Trading Model
+
+- Universe is hard-coded in `include/hft/engine/universe.hpp`.
+- Strategy: mean-reversion market maker in `include/hft/engine/strategy/mm_mean_reversion.hpp`.
+- Fills are simulated from public prints in `include/hft/engine/sim/fill_sim.hpp`.
+- Orders use the local wire protocol in `include/hft/protocol/wire.h`.
+
+## Dashboard & Control
+
+Operator panels: session cards, per-symbol matrix, execution quality, risk radar, order/ACK blotters, observer/transport health.
+
+HTTP control endpoints:
+
+- `GET  /api/state`
+- `POST /api/command/kill-global`
+- `POST /api/command/arm-all`
+- `POST /api/command/kill-symbol`
+- `POST /api/command/arm-symbol`
+
+The trading process listens for the same actions on its local control socket:
+
+- `kill_global`, `arm_all`, `kill_symbol <stock_locate>`, `arm_symbol <stock_locate>`
+
+## Data
+
+Replay needs a NASDAQ TotalView-ITCH 5.0 file at `data/01302020.NASDAQ_ITCH50` (or override via `HFT_SERVER_ITCH_FILE`). The protocol PDF lives alongside it. NASDAQ publishes both freely; this repository does not redistribute them — see [`data/README.md`](data/README.md).
 
 ## Build
 
-### Prerequisites
-
-- Linux
-- CMake `>= 3.16`
-- a C11/C++20-capable compiler
-- `libxdp`
-- `libbpf`
-- `libelf`
-- `zlib`
-- `pthread`
-- `clang` if you want the custom XDP filter object built automatically
-
-The CMake file also supports a local fallback layout via:
-
-- `XDP_TUTORIAL_ROOT=../xdp-tutorial`
-
-If the required XDP or BPF headers are missing, configuration fails early.
-
-### Configure and Build
+Requirements: Linux, CMake ≥ 3.16, C11 + C++20, `libxdp`, `libbpf`, `libelf`, `zlib`, `pthread`. `clang` is needed to build the XDP filter object.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+git submodule update --init --recursive
+cd third_party/xdp-tutorial && ./configure && make lib && cd -
+./scripts/build/all.sh
 ```
 
-Built binaries are written to:
+`make lib` builds `libbpf` + `libxdp` and installs them under `third_party/xdp-tutorial/lib/install/`; the project's CMake picks them up automatically. To use system `libxdp-dev` / `libbpf-dev`, point `-DXDP_TUTORIAL_ROOT=` at an existing built tree.
 
-- `build/bin/server`
-- `build/bin/client`
-- `build/bin/engine`
+Per-target scripts: `./scripts/build/{server,trading,observer,stack}.sh`. Artifacts land in `build/bin/{server,trading,wire_observer}`.
 
-### Pinning Configuration
-
-Thread/core placement is configured through CMake cache variables:
+Core-pinning knobs (CMake cache):
 
 ```bash
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DHFT_SERVER_FEED_CORE=2 \
   -DHFT_SERVER_ORDER_RECV_CORE=3 \
   -DHFT_CLIENT_UDP_RECV_CORE=4 \
   -DHFT_CLIENT_ORDER_SEND_CORE=5 \
-  -DHFT_ENGINE_DISPATCH_CORE=6 \
-  -DHFT_ENGINE_LANE1_CORE=7 \
-  -DHFT_ENGINE_RESET_CORE=8 \
-  -DHFT_ENGINE_RESET_LANE1_CORE=9
+  -DHFT_ENGINE_DISPATCH_CORE=6
 ```
 
-At the moment, `server` and `client` use their configured thread affinities directly, while the `engine` code actively pins only the dispatcher thread. The extra engine core cache entries are present for the lane/reset layout the code is clearly evolving toward, but they are not all consumed by the current implementation yet.
+Tuned one-shot bring-up (builds, applies host tuning, starts the stack):
+
+```bash
+sudo ./scripts/all.sh
+```
+
+This sets CPU affinity, SCHED_FIFO via `chrt`, transparent + reserved 2 MiB hugepages, memlock limits, and clears stale XDP attachments before launching.
 
 ## Run
 
-### Recommended Launch Order
-
-Start the engine first so the shared-memory regions exist before the client tries to open them.
-
-Terminal 1:
-
 ```bash
-./build/bin/engine
+./scripts/run/stack.sh      # optional: control + RabbitMQ + Postgres (Docker)
+./scripts/run/server.sh
+./scripts/run/trading.sh
+./scripts/run/observer.sh
 ```
 
-Terminal 2:
+Dashboard at `http://localhost:8080`. After editing dashboard or control-service files:
 
 ```bash
-sudo env HFT_AFXDP_IFACE=lo HFT_AFXDP_PREFER_SKB=1 ./build/bin/client
+docker compose up -d --build control
 ```
 
-Terminal 3:
+## Daily Audit Logs
 
-```bash
-./build/bin/server 4 5000 127.0.0.1 data/01302020.NASDAQ_ITCH50 1.0
-```
+With the control stack running, the control service appends a daily JSONL log to `results/dashboard_logs/dashboard_YYYYMMDD.txt`:
 
-That command starts:
+- `telemetry` — every dashboard-visible event (`feed`, `order`, `ack`, `health`, `mm_stats`, `lat_stats`) and operator commands.
+- `order_ack` — correlated record per acked order with `symbol`, `side`, `qty`, `price`, `seq`, `msgType`, four ns-precision timestamps (`orderObserveTs`, `clientSendTs`, `serverRecvTs`, `ackObserveTs`), and three derived latencies.
 
-- server mode `4` = timestamp replay
-- UDP destination `127.0.0.1:5000`
-- replay file `data/01302020.NASDAQ_ITCH50`
-- speed `1.0x`
-
-### Server Modes
-
-- `1` normal sequential replay
-- `2` lossy mode, drops every 100th packet
-- `3` chaotic mode, duplicates every 10th packet
-- `4` timestamp replay mode with configurable speed
-
-Modes `1` to `3` intentionally wait `30` seconds before sending so you have time to start the rest of the pipeline. Mode `4` starts immediately.
-
-### Client Runtime Knobs
-
-- `HFT_AFXDP_IFACE`
-  interface to bind, defaults to `lo`
-- `HFT_AFXDP_QUEUE`
-  AF_XDP queue id, defaults to `0`
-- `HFT_AFXDP_FORCE_ZEROCOPY`
-  request zero-copy mode first
-- `HFT_AFXDP_PREFER_SKB`
-  prefer SKB mode over native XDP
-
-If AF_XDP setup fails on the requested interface, the client already contains retry logic that falls back to loopback copy-mode paths where possible.
-
-### Notes on Privileges
-
-AF_XDP and XDP attach operations commonly require elevated privileges or the equivalent Linux capabilities. The sample launch above uses `sudo` for the client for that reason.
-
-## Design Tradeoffs
-
-This project favors:
-
-- explicit, inspectable dataflow
-- fast local replay iteration
-- low-overhead ring-based communication
-- stage-level latency measurement
-- CPU-specific tuning such as `-march=native`, AVX2, and LTO
-
-It does not currently try to solve:
-
-- full exchange matching
-- portfolio-level strategy logic
-- persistence or recovery
-- multi-symbol sharding across processes
-- gateway/session management
-- production-grade retransmit handling
-- kernel-bypass order egress
-
-## Current Strategy and Risk Model
-
-### Imbalance Strategy
-
-The current strategy is deliberately simple:
-
-- aggregate buy and sell quantity by `stock_locate`
-- require minimum total quantity `>= 1`
-- emit a buy when bid ratio `>= 0.20`
-- emit a sell when ask ratio `>= 0.20`
-- send a fixed order size of `1`
-
-### Risk Controls
-
-Inline risk checks currently enforce:
-
-- max position per stock: `10000`
-- max order quantity: `500`
-- max orders per second: `100`
-- burst tokens: `50`
-
-Notional caps are present but effectively unbounded in the current configuration.
+Files run ~10 GB / trading hour. `scripts/utils/compact_dashboard_log.py` distills them into queryable CSVs (~62× compression).
 
 ## Repository Layout
 
-- `CMakeLists.txt`
-  build, flags, library detection, and CPU-core pinning config
-- `apps/server/`
-  UDP ITCH replay and TCP order receiver
-- `apps/client/`
-  AF_XDP ingress, parser thread, and TCP order sender
-- `apps/engine/`
-  engine dispatcher entry point
-- `src/engine/`
-  SIMD compute path, strategy, risk, and OMS
-- `src/parser/`
-  ITCH packet-to-event conversion
-- `src/itch/`
-  ITCH message structs and handler dispatch
-- `src/afxdp/`
-  AF_XDP socket setup and XDP BPF filter
-- `src/pools/`
-  event and message object pools
-- `include/hft/`
-  all project headers, namespaced under `hft/`
-- `include/hft/ring_buffers/`
-  parser, event, and order ring definitions
-- `scripts/`
-  build and run helpers
-- `data/`
-  replay input
-- `results/`
-  generated latency logs
+- `apps/server/` — feed, order receiver, rewinder
+- `apps/engine/` — fused trading dispatcher entrypoint
+- `apps/client/` — AF_XDP RX and order-send threads (linked into `trading`)
+- `apps/observer/` — passive wire observer
+- `src/afxdp/` — AF_XDP RX/TX path and XDP filter
+- `src/itch/` — ITCH parsing (SIMD)
+- `src/engine/` — risk + OMS implementations
+- `src/telemetry/` — local control socket + stats thread
+- `include/hft/engine/` — universe, strategy, risk, fill sim, OMS interfaces
+- `services/control/` — dashboard backend (Node.js)
+- `dashboard/` — static frontend
+- `scripts/build/` — per-target build scripts
+- `scripts/run/` — per-component run scripts (`all.sh` is the tuned orchestrator)
+- `scripts/utils/` — `top_symbols.py`, `bench_latency.sh`, `bench_report.py`, `compact_dashboard_log.py`
 
-## Limitations
+## Environment Variables
 
-- Linux-only in practice because of AF_XDP and XDP dependencies
-- the current client captures a single UDP feed path
-- the strategy is intentionally minimal and not alpha-focused
-- GPU and FPGA entry files exist but are not wired into the active build
-- timestamp accuracy is useful for comparison, not a substitute for production telemetry
-- order receiver sampling logs every 100th order rather than every order
+| Var | Purpose |
+| --- | --- |
+| `HFT_SERVER_MODE`            | replay mode for `server`; `4` = timestamp |
+| `HFT_SERVER_SPEED`           | replay speed multiplier |
+| `HFT_SERVER_ITCH_FILE`       | override the default ITCH file |
+| `HFT_AFXDP_IFACE`            | AF_XDP interface (default `lo`) |
+| `HFT_AFXDP_PREFER_SKB`       | loopback-friendly fallback (default `1`) |
+| `HFT_AFXDP_FORCE_ZEROCOPY`   | request zero-copy when supported |
+| `HFT_AFXDP_TX=1`             | switch order egress from TCP to AF_XDP TX |
+| `HFT_DEADMAN_MS`             | enable the trading dead-man watchdog |
+| `HFT_CONTROL_SOCKET`         | control socket path (default `run/hft-control.sock`) |
+| `HFT_TELEMETRY_SOCKET`       | telemetry socket path (default `run/hft-telemetry.sock`) |
+| `HFT_DASHBOARD_LOG_DIR`      | override the dashboard log directory |
+| `HFT_MM_*`                   | strategy knobs — half-spread, EMA, RPS, inventory limits |
 
-## Future Work
+## Latency Benchmark
 
-- expose batch-mode presets through CMake options
-- add richer retransmit and sequence-gap handling
-- widen the strategy beyond a single imbalance heuristic
-- add deterministic replay validation and correctness tests
-- benchmark with isolated CPUs and broader perf counter capture
-- wire up the GPU and FPGA experiment paths or remove the placeholders
+`scripts/utils/bench_latency.sh` produces a time-boxed, self-contained report under `results/bench_<ts>/`:
+
+```bash
+sudo ./scripts/utils/bench_latency.sh           # default: 15 s warm-up + 120 s window
+sudo ./scripts/utils/bench_latency.sh 300       # 5-minute window
+HFT_BENCH_ASSUME_RUNNING=1 ./scripts/utils/bench_latency.sh   # attach to a running stack
+```
+
+`report.md` / `report.json` cover: throughput (totals + per-second + peak 1 s order rate), loss (transport drops, ACK seq gaps, ACK checksum failures), latency percentiles for all four legs, CPU counters (`perf stat`: cycles/instructions/cache/branch/ctxt/page-faults plus derived IPC, cycles/order, ctxt-sw/s), process delta (RSS, hugetlb pages, I/O bytes, voluntary/involuntary ctxt switches), and a preflight snapshot of governor / `isolcpus` / hugepages / `perf_event_paranoid` / kernel/CPU.

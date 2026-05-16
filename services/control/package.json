@@ -1,0 +1,13 @@
+{
+  "name": "hft-control-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.5",
+    "pg": "^8.13.1"
+  }
+}

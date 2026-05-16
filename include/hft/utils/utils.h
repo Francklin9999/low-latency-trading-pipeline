@@ -6,12 +6,18 @@
 #ifndef be16toh
 #define be16toh(x) __builtin_bswap16(x)
 #endif
+#ifndef be32toh
+#define be32toh(x) __builtin_bswap32(x)
+#endif
 #ifndef be64toh
 #define be64toh(x) __builtin_bswap64(x)
 #endif
 #else
 #ifndef be16toh
 #define be16toh(x) (x)
+#endif
+#ifndef be32toh
+#define be32toh(x) (x)
 #endif
 #ifndef be64toh
 #define be64toh(x) (x)

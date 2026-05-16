@@ -1,0 +1,51 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: 123
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: hft
+      POSTGRES_USER: hft
+      POSTGRES_PASSWORD: hft
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  control:
+    build:
+      context: .
+      dockerfile: services/control/Dockerfile
+    environment:
+      PORT: 8080
+      AMQP_URL: amqp://admin:123@rabbitmq:5672
+      DATABASE_URL: postgres://hft:hft@postgres:5432/hft
+      TELEMETRY_SOCKET: /app/run/hft-telemetry.sock
+      CONTROL_SOCKET: /app/run/hft-control.sock
+      HFT_DASHBOARD_LOG_DIR: /app/results/dashboard_logs
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./results:/app/results
+      - ./run:/app/run
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_started
+
+volumes:
+  postgres_data:

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HFT Execution Desk</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">HFT</span>
+          <span class="brand-name">Execution Desk</span>
+          <span id="connection-state" class="badge">Connecting</span>
+        </div>
+
+        <div class="topbar-stats">
+          <div class="stat">
+            <span class="stat-label">Snapshot</span>
+            <strong id="last-snapshot">--</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Feed Seq</span>
+            <strong id="feed-seq">0</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Drops</span>
+            <strong id="transport-drops">0</strong>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="arm-all">Arm All</button>
+          <button id="kill-global" class="danger">Kill Global</button>
+        </div>
+      </header>
+
+      <section class="summary-grid" id="summary-cards"></section>
+
+      <section class="terminal-grid">
+        <article class="panel panel-overview">
+          <div class="panel-header"><h2>Session</h2></div>
+          <div id="desk-overview"></div>
+        </article>
+
+        <article class="panel panel-execution">
+          <div class="panel-header"><h2>Execution Quality</h2></div>
+          <div id="execution-quality"></div>
+        </article>
+
+        <article class="panel panel-risk">
+          <div class="panel-header"><h2>Risk</h2></div>
+          <div id="risk-radar"></div>
+        </article>
+
+        <article class="panel panel-leaders">
+          <div class="panel-header"><h2>P&amp;L Leaders</h2></div>
+          <div id="top-symbols"></div>
+        </article>
+
+        <article class="panel panel-matrix">
+          <div class="panel-header"><h2>Symbols</h2></div>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Status</th>
+                  <th>Bid</th>
+                  <th>Ask</th>
+                  <th>Spread</th>
+                  <th>Orders</th>
+                  <th>Fills</th>
+                  <th>Inv</th>
+                  <th>rPnL</th>
+                  <th>uPnL</th>
+                  <th>Rate Lim</th>
+                  <th>Last Seq</th>
+                  <th>Control</th>
+                </tr>
+              </thead>
+              <tbody id="symbols-body"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel panel-orders">
+          <div class="panel-header"><h2>Orders</h2></div>
+          <div id="orders"></div>
+        </article>
+
+        <article class="panel panel-acks">
+          <div class="panel-header"><h2>ACKs</h2></div>
+          <div id="acks"></div>
+        </article>
+
+        <article class="panel panel-health">
+          <div class="panel-header"><h2>Transport</h2></div>
+          <div id="health"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
